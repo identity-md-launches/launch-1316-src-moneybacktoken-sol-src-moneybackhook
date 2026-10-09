@@ -1,0 +1,20 @@
+{
+  "kind": "univ4_hook",
+  "token": { "contract": "MoneyBackToken", "name": "IMD Money Back", "symbol": "MONEYBACK", "decimals": 18 },
+  "hook": {
+    "contract": "MoneyBackHook",
+    "constructorArgs": ["$poolManager", "$token", "$owner"],
+    "permissions": ["beforeInitialize", "beforeSwap", "afterSwap", "beforeSwapReturnDelta", "afterSwapReturnDelta"]
+  },
+  "contracts": [
+    { "contract": "RoundPayout", "constructorArgs": ["$owner"] },
+    { "contract": "MoneyBackRouter", "constructorArgs": ["$poolManager", "$contract:MoneyBackHook"] }
+  ],
+  "pool": {
+    "pairedCurrency": "0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "IMD Money Back (MONEYBACK) for Robinhood Chain 4663, paired with IMD 0x5F7Bb59365ce557C26dbcAa4EE9d39A4b95B7127. Contracts written, tested and reviewed by the IMD swarm in jobs 57052175 and cb7160d0 (launch-1178 repo, commit c38bc4a8). MoneyBackToken has no constructor arguments and mints 1,000,000,000e18 once to the deployer. MoneyBackHook takes (IPoolManager manager, address launchToken, address payout) as $poolManager, $token, $owner; payout is the paying wallet, not RoundPayout. It declares beforeInitialize, beforeSwap, afterSwap, beforeSwapReturnDelta and afterSwapReturnDelta (address flag bits 0x20CC) and binds exactly one pool: token/IMD, LP fee 12500, tickSpacing 60. On every swap it takes 4.25% (425 bps) of the IMD leg, always in IMD, in beforeSwap when IMD is the specified currency and in afterSwap otherwise; sells additionally pay a surcharge of 2000 bps at initialization decaying linearly to 0 at +1800 s. Fees accrue as the hook's ERC-6909 IMD claims; permissionless sweep() takes all of them to payout. No owner, setter, pause or upgrade. RoundPayout(initialOwner = $owner) is the engine's batch payer and the only contract with an owner: payRound is idempotent per roundId, records failed legs without reverting the batch, retryFailed/writeOffFailed, pause/unpause, Ownable2Step. MoneyBackRouter(IPoolManager manager, address hook) as $poolManager, $contract:MoneyBackHook lets buyers pay ETH: buyWithEth swaps ETH to IMD on the public ETH/IMD pool (currency0 native ETH, currency1 IMD, fee 10000, tickSpacing 100, no hook) then IMD to MONEYBACK on our pool in one unlock, refunding dust; sellForEth does the reverse; quoteBuy/quoteSell views; it holds nothing between calls and has no owner. All v4 and OpenZeppelin surfaces are inlined with matching selectors, so the project builds offline with no dependencies. initialPrice is provenance; the factory derives the opening price from launch economics."
+}
