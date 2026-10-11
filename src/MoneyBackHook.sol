@@ -136,7 +136,7 @@ library Hooks {
 /// @notice Uniswap v4 hook for the single MONEYBACK / IMD pool (static LP fee 12500 = 1.25%,
 ///         tickSpacing 60). On every swap it takes a hook fee in IMD, on top of the pool's LP fee,
 ///         and accrues it as PoolManager ERC-6909 claims owned by this contract. Anyone can call
-///         `sweep()` to move everything accrued to the immutable `payout` address (RoundPayout).
+///         `sweep()` to move everything accrued to the immutable paying wallet, `payout`.
 ///
 /// @dev FEE MATHS (all integer, all rounded down, all in IMD, never in MONEYBACK)
 ///
@@ -171,6 +171,10 @@ library Hooks {
 ///      In short: IMD specified (cases 1 and 4) -> beforeSwapReturnDelta on the specified
 ///      currency; IMD unspecified (cases 2 and 3) -> afterSwapReturnDelta on the unspecified
 ///      currency. Each swap is charged in exactly one of the two callbacks, never both.
+///      Cases 1 and 4 must fill the entire adjusted specified amount: afterSwap reverts
+///      PartialFill otherwise, rolling back the swap and its claims. This prevents charging
+///      a fee on IMD that the pool did not consume or deliver. Cases 2 and 3 may partially
+///      fill because their fee is computed from the actual pool delta.
 ///
 ///      Invariants:
 ///      - The hook never returns a non-zero delta on the MONEYBACK side and never mints
@@ -216,7 +220,7 @@ contract MoneyBackHook is IHooks, IUnlockCallback {
     IPoolManager public immutable poolManager;
     /// @notice The MONEYBACK token.
     address public immutable launchToken;
-    /// @notice Where sweep() sends accrued IMD (the RoundPayout contract). Fixed forever.
+    /// @notice Where sweep() sends accrued IMD (the paying wallet). Fixed forever.
     address public immutable payout;
 
     /// @dev ERC-6909 claim id of IMD inside the PoolManager (uint256(uint160(IMD))).
@@ -258,6 +262,7 @@ contract MoneyBackHook is IHooks, IUnlockCallback {
     error WrongHook();
     error Reentrancy();
     error AmountOverflow();
+    error PartialFill();
 
     // ---------------------------------------------------------------------------------------------
     // Constructor
@@ -265,7 +270,7 @@ contract MoneyBackHook is IHooks, IUnlockCallback {
 
     /// @param manager      The Uniswap v4 PoolManager ($poolManager).
     /// @param launchToken_ The MONEYBACK token ($token).
-    /// @param payout_      The RoundPayout contract that receives swept IMD ($owner).
+    /// @param payout_      The paying wallet that receives swept IMD ($owner).
     /// @dev Makes no external calls and accepts no ETH. Reverts unless this contract's address
     ///      carries exactly the permission flag bits (CREATE2 salt mining is the deployer's job).
     constructor(IPoolManager manager, address launchToken_, address payout_) {
@@ -395,8 +400,8 @@ contract MoneyBackHook is IHooks, IUnlockCallback {
     }
 
     /// @notice Cases 2 and 3 (IMD is the unspecified currency): takes the hook fee on the IMD the
-    ///         pool actually moved, via a positive unspecified delta. Cases 1 and 4 return 0 here
-    ///         because they were charged in beforeSwap.
+    ///         pool actually moved, via a positive unspecified delta. Cases 1 and 4 verify a
+    ///         complete fill and return 0 because they were charged in beforeSwap.
     function afterSwap(address, PoolKey calldata key, SwapParams calldata params, BalanceDelta delta, bytes calldata)
         external
         returns (bytes4, int128)
@@ -406,9 +411,17 @@ contract MoneyBackHook is IHooks, IUnlockCallback {
 
         bool isSell = _isSell(params.zeroForOne);
         bool exactInput = params.amountSpecified < 0;
-        if (exactInput != isSell) return (IHooks.afterSwap.selector, 0);
-
         int256 imdDelta = _imdIsCurrency0 ? _amount0(delta) : _amount1(delta);
+        if (exactInput != isSell) {
+            uint256 specified = exactInput ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
+            (uint256 baseFee, uint256 surcharge) = _feeParts(isSell, specified);
+            // v4 adds the beforeSwap specified delta to amountSpecified before swapping.
+            // The fee is deterministic within this transaction (fixed constants and timestamp);
+            // no transient state is needed, including for multiple swaps in the same unlock.
+            if (imdDelta != params.amountSpecified + int256(baseFee + surcharge)) revert PartialFill();
+            return (IHooks.afterSwap.selector, 0);
+        }
+
         uint256 imdLeg = imdDelta < 0 ? uint256(-imdDelta) : uint256(imdDelta);
         uint256 hookFee = _accrue(isSell, imdLeg);
         return (IHooks.afterSwap.selector, _toInt128(hookFee));
@@ -462,11 +475,15 @@ contract MoneyBackHook is IHooks, IUnlockCallback {
     /// @dev Computes base fee and surcharge on `imdLeg` (each floored), mints the total as IMD
     ///      claims to this hook, emits FeeAccrued, returns the total.
     function _accrue(bool isSell, uint256 imdLeg) private returns (uint256 hookFee) {
-        uint256 baseFee = imdLeg * BASE_FEE_BPS / BPS;
-        uint256 surcharge = isSell ? imdLeg * currentSurchargeBps() / BPS : 0;
+        (uint256 baseFee, uint256 surcharge) = _feeParts(isSell, imdLeg);
         hookFee = baseFee + surcharge;
         if (hookFee != 0) poolManager.mint(address(this), _imdId, hookFee);
         emit FeeAccrued(isSell, baseFee, surcharge, imdLeg);
+    }
+
+    function _feeParts(bool isSell, uint256 imdLeg) private view returns (uint256 baseFee, uint256 surcharge) {
+        baseFee = imdLeg * BASE_FEE_BPS / BPS;
+        surcharge = isSell ? imdLeg * currentSurchargeBps() / BPS : 0;
     }
 
     function _toInt128(uint256 x) private pure returns (int128) {

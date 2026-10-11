@@ -15,6 +15,7 @@ import {
 /// @dev Minimal ERC-20 surface the router needs (OpenZeppelin IERC20 selectors).
 interface IERC20 {
     function transferFrom(address from, address to, uint256 value) external returns (bool);
+    function transfer(address to, uint256 value) external returns (bool);
 }
 
 /// @dev The v4-core `IPoolManager` functions the router calls beyond the ones the hook already
@@ -47,8 +48,8 @@ interface IRouterPoolManager is IPoolManager {
 ///         - The router holds nothing between calls: every call ends by taking all MONEYBACK and
 ///           any IMD or ETH left over to msg.sender. Its ETH, IMD and MONEYBACK balances (and its
 ///           PoolManager deltas) are zero after every call.
-///         - It never approves anyone for anything and keeps no allowance from anyone: sellers'
-///           MONEYBACK is pulled with transferFrom straight into the PoolManager.
+///         - It never approves anyone for anything: sellers' MONEYBACK is pulled from msg.sender
+///           before unlock, then the consumed amount is settled from the router's own balance.
 ///         - No owner, no setter, no pause, no upgrade, no selfdestruct.
 ///         - unlockCallback only runs for the PoolManager, and only with the exact data a buy,
 ///           sell or quote of this contract just passed to unlock(), once per call; buy, sell and
@@ -145,6 +146,7 @@ contract MoneyBackRouter is IUnlockCallback {
     error PoolNotBound();
     error AmountOverflow();
     error TransferFromFailed();
+    error TransferFailed();
     error EthTransferFailed();
     /// @dev Carries a quote out of the always-reverting simulation unlock. Never reaches a caller.
     error QuoteResult(uint256 amountOut);
@@ -154,7 +156,7 @@ contract MoneyBackRouter is IUnlockCallback {
     // ---------------------------------------------------------------------------------------------
 
     /// @param manager The Uniswap v4 PoolManager ($poolManager).
-    /// @param hook_   The deployed MoneyBackHook ($contract:MoneyBackHook). The MONEYBACK token
+    /// @param hook_   The actual deployed MoneyBackHook address. The MONEYBACK token
     ///                is read from it; the pool key is read from it on every call, so the router
     ///                may be deployed before the pool is initialized.
     constructor(IPoolManager manager, address hook_) {
@@ -222,10 +224,15 @@ contract MoneyBackRouter is IUnlockCallback {
         _enter();
         if (block.timestamp > deadline) revert Expired();
         if (tokens == 0) revert ZeroAmount();
+        if (tokens > uint256(uint128(type(int128).max))) revert AmountOverflow();
+
+        if (!IERC20(token).transferFrom(msg.sender, address(this), tokens)) revert TransferFromFailed();
 
         Result memory r = _run(CallbackData(Action.Sell, msg.sender, tokens, minEthOut));
         ethOut = r.amountOut;
 
+        uint256 unused = tokens - r.amountIn;
+        if (unused != 0 && !IERC20(token).transfer(msg.sender, unused)) revert TransferFailed();
         _sendAllEth(msg.sender);
         emit SoldForEth(msg.sender, r.amountIn, r.imdMid, ethOut);
         _exit();
@@ -319,25 +326,22 @@ contract MoneyBackRouter is IUnlockCallback {
         if (imdDust != 0) poolManager.take(Currency.wrap(IMD), d.user, imdDust);
     }
 
-    /// @dev MONEYBACK -> IMD on our pool, IMD -> ETH on the public pool. For a real sell, pulls the
-    ///      MONEYBACK from the user straight into the PoolManager, takes the ETH to this contract
-    ///      (forwarded by the caller) and any IMD or MONEYBACK left over to the user. A quote only swaps.
+    /// @dev MONEYBACK -> IMD on our pool, IMD -> ETH on the public pool. For a real sell, settles
+    ///      consumed MONEYBACK from this contract, takes ETH here and any IMD dust to the user.
+    ///      sellForEth refunds unused MONEYBACK from this contract after unlock. A quote only swaps.
     function _sell(CallbackData memory d) private returns (Result memory r) {
         bool quote = d.action == Action.QuoteSell;
 
-        uint256 tokensIn = d.amount;
-        if (!quote) {
-            poolManager.sync(Currency.wrap(token));
-            if (!IERC20(token).transferFrom(d.user, address(poolManager), tokensIn)) revert TransferFromFailed();
-            tokensIn = poolManager.settle();
-            if (tokensIn == 0) revert ZeroAmount();
-        }
-
         // Leg 1: exact-input MONEYBACK -> IMD on our pool. The hook charges base fee + surcharge inside.
         (PoolKey memory key, bool imdIs0) = _launchPool();
-        (int256 a0, int256 a1) = _swap(key, !imdIs0, tokensIn);
+        (int256 a0, int256 a1) = _swap(key, !imdIs0, d.amount);
         (int256 imdDelta, int256 tokenDelta) = imdIs0 ? (a0, a1) : (a1, a0);
         r.amountIn = uint256(-tokenDelta);
+        if (!quote) {
+            poolManager.sync(Currency.wrap(token));
+            if (!IERC20(token).transfer(address(poolManager), r.amountIn)) revert TransferFailed();
+            poolManager.settle();
+        }
         uint256 imdOut = uint256(imdDelta);
         if (imdOut == 0) return r;
 
@@ -350,8 +354,6 @@ contract MoneyBackRouter is IUnlockCallback {
         if (r.amountOut != 0) poolManager.take(Currency.wrap(address(0)), address(this), r.amountOut);
         uint256 imdDust = imdOut - r.imdMid;
         if (imdDust != 0) poolManager.take(Currency.wrap(IMD), d.user, imdDust);
-        uint256 tokenDust = tokensIn - r.amountIn;
-        if (tokenDust != 0) poolManager.take(Currency.wrap(token), d.user, tokenDust);
     }
 
     /// @dev Exact-input swap of `amountIn` with the widest price limit and no hook data.

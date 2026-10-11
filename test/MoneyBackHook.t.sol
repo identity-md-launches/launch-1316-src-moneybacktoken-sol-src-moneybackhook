@@ -1117,19 +1117,40 @@ contract MoneyBackHookTest is HookFixture {
     }
 
     function test_fixedCallbacksOnlyChargeTheirOwnCases() public {
-        // beforeSwap on cases 2/3 returns zero and mints nothing; afterSwap on cases 1/4 likewise.
+        // beforeSwap on cases 2/3 returns zero; afterSwap on cases 1/4 validates the full fill without minting.
         vm.startPrank(address(pm));
         (, BeforeSwapDelta d2,) = hook.beforeSwap(address(this), key, _params(2, 1e18), "");
         (, BeforeSwapDelta d3,) = hook.beforeSwap(address(this), key, _params(3, 1e18), "");
-        BalanceDelta big = BalanceDelta.wrap(int256(-1e18) << 128 | int256(1e18));
-        (, int128 u1) = hook.afterSwap(address(this), key, _params(1, 1e18), big, "");
-        (, int128 u4) = hook.afterSwap(address(this), key, _params(4, 1e18), big, "");
+        // This fixture has IMD as currency0. Deltas are before applying the hook's fee.
+        BalanceDelta buy = BalanceDelta.wrap(int256(-0.9575e18) << 128 | int256(0.94e18));
+        BalanceDelta sell = BalanceDelta.wrap(int256(1.2425e18) << 128 | int256(uint256(uint128(int128(-1.26e18)))));
+        (, int128 u1) = hook.afterSwap(address(this), key, _params(1, 1e18), buy, "");
+        (, int128 u4) = hook.afterSwap(address(this), key, _params(4, 1e18), sell, "");
         vm.stopPrank();
         assertEq(BeforeSwapDelta.unwrap(d2), 0, "case 2 not charged in beforeSwap");
         assertEq(BeforeSwapDelta.unwrap(d3), 0, "case 3 not charged in beforeSwap");
         assertEq(int256(u1), 0, "case 1 not charged in afterSwap");
         assertEq(int256(u4), 0, "case 4 not charged in afterSwap");
         assertEq(hook.pending(), 0, "nothing minted");
+    }
+
+    function testFuzz_specifiedOneWeiUnderfillAlwaysRefused(uint96 raw, uint32 elapsed, bool sell) public {
+        uint256 amount = uint256(raw) % 1e24 + 1;
+        vm.warp(T0 + uint256(elapsed) % 3601);
+        uint256 fee = amount * 425 / BPS + (sell ? amount * hook.currentSurchargeBps() / BPS : 0);
+        int256 expected = sell ? int256(amount + fee) : -int256(amount - fee);
+        // Fixture IMD is currency0. One raw unit missing is a partial fill even if the fee rounds to zero.
+        int256 filled = sell ? expected - 1 : expected + 1;
+        BalanceDelta delta = BalanceDelta.wrap(filled << 128);
+        vm.prank(address(pm));
+        vm.expectRevert(abi.encodeWithSelector(MoneyBackHook.PartialFill.selector));
+        hook.afterSwap(address(this), key, _params(sell ? 4 : 1, amount), delta, "");
+    }
+
+    function test_specifiedZeroFeeUnderfillRefused() public {
+        vm.prank(address(pm));
+        vm.expectRevert(abi.encodeWithSelector(MoneyBackHook.PartialFill.selector));
+        hook.afterSwap(address(this), key, _params(1, 1), BalanceDelta.wrap(0), "");
     }
 
     function test_hugeSpecifiedAmountRevertsAmountOverflow() public {

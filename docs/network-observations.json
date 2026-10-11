@@ -1,0 +1,36 @@
+{
+  "checkedAtUtc": "2026-10-11T14:54:35.602760+00:00",
+  "rpc": "http://127.0.0.1:44055/rpc/4663",
+  "chainId": 4663,
+  "blockNumber": 85912608,
+  "blockHash": "0x673cd8ee41179c836decdcdb2e5200cd40fc9eb69caef04a62ba293bd166b218",
+  "purpose": "Read-only reproduction of imported audit finding c0c14411f2d25d5ec04d8761a7de039000b1350eeca0e570ba549d2e05bde0fe. The observed PoolManager is not a constructor default; the launch still resolves $poolManager.",
+  "imd": {
+    "address": "0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127",
+    "symbol": "IMD",
+    "decimals": 18,
+    "codeBytes": 15448,
+    "codeKeccak256": "0xa9a0e893f7d8327fe96f823291ad9199af5456c2f9fd80bbdeff29d1e91a93e2"
+  },
+  "poolManager": {
+    "observedAddress": "0x8366a39cc670b4001a1121b8f6a443a643e40951",
+    "addressSource": "Imported audit supplied with assignment",
+    "codeBytes": 24009,
+    "codeKeccak256": "0xbd3881180b547f5fe817545743cfb4343e96b1bc6640dcd70c106b0066e95626"
+  },
+  "publicPool": {
+    "currency0": "0x0000000000000000000000000000000000000000",
+    "currency1": "0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127",
+    "fee": 10000,
+    "tickSpacing": 100,
+    "hooks": "0x0000000000000000000000000000000000000000",
+    "poolId": "0xd2fc01ee6f8400b6b4ea3b341a188568f2bd6c72b07b96741a82396fa6eb8f02",
+    "stateSlot": "0xed0908972407419d08d7b698ef3fd5004a66939243d3da29ce1e359e9c47c384",
+    "rawSlot0": "0x0000000027103e83e800dc2a0000000000000010be478b386579e03f5ee3fea7",
+    "sqrtPriceX96": "1326539243276748512267027611303",
+    "tick": 56362,
+    "lpFee": 10000,
+    "activeLiquidity": "1331843625446754641305"
+  },
+  "limitations": "Read-only code/metadata/state checks. No transaction broadcast and no assertion of future liquidity or final launch deployment."
+}

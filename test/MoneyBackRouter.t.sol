@@ -19,6 +19,13 @@ import {MoneyBackToken} from "src/MoneyBackToken.sol";
 // No forge-std is vendored and the test paths may not add a lib/, so this suite talks to the
 // Foundry cheatcode address through the minimal interface below. A failing assertion reverts.
 interface VmRouter {
+    struct Log {
+        bytes32[] topics;
+        bytes data;
+        address emitter;
+    }
+    function recordLogs() external;
+    function getRecordedLogs() external returns (Log[] memory);
     function prank(address) external;
     function startPrank(address) external;
     function stopPrank() external;
@@ -760,7 +767,8 @@ contract RouterHandler is RouterFixture {
         vm.prank(a);
         try router.buyWithEth{value: ethIn}(minOut, deadline) returns (uint256 out) {
             require(
-                ethIn != 0 && q.tokensOut != 0 && minOut <= q.tokensOut && deadline >= block.timestamp,
+                ethIn != 0 && q.tokensOut != 0 && q.imdDust == 0 && minOut <= q.tokensOut
+                    && deadline >= block.timestamp,
                 "buy should have reverted"
             );
             require(out == q.tokensOut, "buy: out != expected");
@@ -771,7 +779,7 @@ contract RouterHandler is RouterFixture {
             buysOk++;
         } catch {
             require(
-                ethIn == 0 || q.tokensOut == 0 || minOut > q.tokensOut || deadline < block.timestamp,
+                ethIn == 0 || q.tokensOut == 0 || q.imdDust != 0 || minOut > q.tokensOut || deadline < block.timestamp,
                 "buy reverted unexpectedly"
             );
             require(
@@ -829,8 +837,14 @@ contract RouterHandler is RouterFixture {
         vm.prank(a);
         if (isBuy) {
             amount = amount % (1_000 ether + 1);
-            uint256 out = router.quoteBuy(amount);
-            require(out == _buyMath(amount).tokensOut, "quoteBuy != formula");
+            BuyMath memory q = _buyMath(amount);
+            try router.quoteBuy(amount) returns (uint256 out) {
+                require(q.imdDust == 0 && out == q.tokensOut, "quoteBuy != formula");
+            } catch (bytes memory reason) {
+                require(
+                    q.imdDust != 0 && bytes4(reason) == MoneyBackHook.PartialFill.selector, "unexpected quote failure"
+                );
+            }
         } else {
             amount = amount % (1_000_000e18 + 1);
             uint256 out = router.quoteSell(amount);
@@ -1311,6 +1325,42 @@ contract MoneyBackRouterTest is RouterFixture {
         _assertRouterEmpty();
     }
 
+    function test_sellPrefundsRouterThenSettlesAndRefundsFromItsOwnBalance() public {
+        pm.setCap(launchId, 300e18);
+        vm.prank(ALICE);
+        token.approve(address(router), 1_000e18);
+        vm.recordLogs();
+        vm.prank(ALICE);
+        router.sellForEth(1_000e18, 0, block.timestamp);
+        VmRouter.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 transfer = keccak256("Transfer(address,address,uint256)");
+        uint256 seen;
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter != address(token) || logs[i].topics[0] != transfer) continue;
+            address from = address(uint160(uint256(logs[i].topics[1])));
+            address to = address(uint160(uint256(logs[i].topics[2])));
+            uint256 amount = abi.decode(logs[i].data, (uint256));
+            if (seen == 0) {
+                assertEq(from, ALICE, "only caller is pulled");
+                assertEq(to, address(router), "prefund router");
+                assertEq(amount, 1_000e18, "pull offered amount");
+            } else if (seen == 1) {
+                assertEq(from, address(router), "settle own balance");
+                assertEq(to, address(pm), "settle manager");
+                assertEq(amount, 300e18, "settle only consumption");
+            } else if (seen == 2) {
+                assertEq(from, address(router), "refund own balance");
+                assertEq(to, ALICE, "refund caller");
+                assertEq(amount, 700e18, "refund unused tokens");
+            } else {
+                revert("unexpected token transfer");
+            }
+            ++seen;
+        }
+        assertEq(seen, 3, "prefund, settle, refund");
+        _assertRouterEmpty();
+    }
+
     function test_sellPullsExactlyTokensAndKeepsNoAllowance() public {
         vm.startPrank(ALICE);
         token.approve(address(router), type(uint256).max);
@@ -1318,7 +1368,7 @@ contract MoneyBackRouterTest is RouterFixture {
         vm.stopPrank();
         assertEq(token.balanceOf(ALICE), 10_000_000e18 - 5e18, "exactly 5 pulled");
         assertEq(token.allowance(ALICE, address(router)), type(uint256).max, "infinite allowance left as is");
-        assertEq(token.balanceOf(address(router)), 0, "router never held the tokens");
+        assertEq(token.balanceOf(address(router)), 0, "router refunded or settled all tokens");
         assertEq(token.allowance(address(router), address(pm)), 0, "router never approves");
         assertEq(token.allowance(address(router), ALICE), 0, "router never approves");
     }
@@ -1342,31 +1392,33 @@ contract MoneyBackRouterTest is RouterFixture {
         _assertRouterEmpty();
     }
 
-    function test_buyRefundsImdDustWhenOurPoolFillsPartially() public {
+    function test_buyRejectsPartialLaunchFillAndRollsBackBothLegs() public {
         pm.setCap(launchId, 100e18);
-        BuyMath memory q = _buyMath(1 ether);
-        assertTrue(q.imdDust > 0, "fixture: dust");
-        assertEq(q.imdMid, 100e18 + q.fee, "pool consumed the cap, hook kept its fee on the full leg");
-        uint256 pmImd = _imdOf(address(pm));
-        vm.expectEmit(true, false, false, true);
-        emit BoughtWithEth(ALICE, 1 ether, q.imdMid, q.tokensOut);
-        uint256 out = _buyAs(ALICE, 1 ether, 0, block.timestamp);
-        assertEq(out, q.tokensOut, "tokens for 100 IMD");
-        assertEq(_imdOf(ALICE), q.imdDust, "unconsumed IMD refunded to the buyer");
-        assertEq(_imdOf(address(pm)), pmImd - q.imdDust, "manager paid the dust out");
-        assertEq(ALICE.balance, 1_000_000 ether - 1 ether, "all ETH consumed by leg 1");
-        assertEq(hook.pending(), q.fee, "fee accrued on the full IMD leg");
-        _assertRouterEmpty();
+        _assertPartialBuyRollback(ALICE);
     }
 
-    function test_buyRefundsBothDustsWhenBothPoolsFillPartially() public {
+    function test_buyRejectsPartialLaunchFillEvenWithPartialPublicFill() public {
         pm.setCap(publicId, 0.5 ether);
         pm.setCap(launchId, 10e18);
-        BuyMath memory q = _buyMath(1 ether);
-        uint256 out = _buyAs(BOB, 1 ether, 0, block.timestamp);
-        assertEq(out, q.tokensOut, "tokens");
-        assertEq(BOB.balance, 1_000_000 ether - 0.5 ether, "ETH dust");
-        assertEq(_imdOf(BOB), q.imdDust, "IMD dust");
+        _assertPartialBuyRollback(BOB);
+    }
+
+    function _assertPartialBuyRollback(address buyer) internal {
+        uint256 ethBefore = buyer.balance;
+        uint256 tokensBefore = token.balanceOf(buyer);
+        uint256 imdBefore = _imdOf(buyer);
+        uint256 pmEth = address(pm).balance;
+        uint256 pending = hook.pending();
+        uint256 logs = pm.swapLogCount();
+        vm.prank(buyer);
+        vm.expectRevert(abi.encodeWithSelector(MoneyBackHook.PartialFill.selector));
+        router.buyWithEth{value: 1 ether}(0, block.timestamp);
+        assertEq(buyer.balance, ethBefore, "ETH returned on revert");
+        assertEq(token.balanceOf(buyer), tokensBefore, "tokens unchanged");
+        assertEq(_imdOf(buyer), imdBefore, "IMD unchanged");
+        assertEq(address(pm).balance, pmEth, "first leg reverted");
+        assertEq(hook.pending(), pending, "no fee retained");
+        assertEq(pm.swapLogCount(), logs, "both swaps rolled back");
         _assertRouterEmpty();
     }
 
@@ -1436,12 +1488,20 @@ contract MoneyBackRouterTest is RouterFixture {
         _assertRouterEmpty();
         uint256 real = _buyAs(ALICE, ethIn, quoted, block.timestamp);
         assertEq(real, quoted, "buy delivers exactly the quote");
-        // With partial fills too.
+        // A partial public fill is still quotable when the launch leg fills completely.
         pm.setCap(publicId, 1 ether);
-        pm.setCap(launchId, 50e18);
         quoted = router.quoteBuy(ethIn);
-        assertEq(quoted, _buyMath(ethIn).tokensOut, "quote with caps");
-        assertEq(_buyAs(BOB, ethIn, quoted, block.timestamp), quoted, "buy with caps delivers the quote");
+        assertEq(quoted, _buyMath(ethIn).tokensOut, "quote with public cap");
+        assertEq(_buyAs(BOB, ethIn, quoted, block.timestamp), quoted, "buy delivers the quote");
+        // A partial launch fill has no executable quote; the hook's error is bubbled up.
+        pm.setCap(launchId, 50e18);
+        pending = hook.pending();
+        logs = pm.swapLogCount();
+        vm.expectRevert(abi.encodeWithSelector(MoneyBackHook.PartialFill.selector));
+        router.quoteBuy(ethIn);
+        assertEq(hook.pending(), pending, "rejected quote retained no claims");
+        assertEq(pm.swapLogCount(), logs, "rejected quote rolled back");
+        _assertRouterEmpty();
     }
 
     function test_quoteSellMatchesSellAndChangesNothing() public {
@@ -1673,6 +1733,18 @@ contract MoneyBackRouterTest is RouterFixture {
         pm.setCap(publicId, capPub % 3 == 0 ? 0 : capPub % 10 ether + 1);
         pm.setCap(launchId, capL % 3 == 0 ? 0 : capL % 10_000e18 + 1);
         BuyMath memory q = _buyMath(ethIn);
+        if (q.imdDust != 0) {
+            vm.expectRevert(abi.encodeWithSelector(MoneyBackHook.PartialFill.selector));
+            router.quoteBuy(ethIn);
+            vm.prank(ALICE);
+            vm.expectRevert(abi.encodeWithSelector(MoneyBackHook.PartialFill.selector));
+            router.buyWithEth{value: ethIn}(0, block.timestamp);
+            assertEq(ALICE.balance, 1_000_000 ether, "partial buy spent nothing");
+            assertEq(hook.pending(), 0, "partial buy retained no claims");
+            assertEq(pm.swapLogCount(), 0, "partial buy reverted both legs");
+            _assertRouterEmpty();
+            return;
+        }
         uint256 quoted = router.quoteBuy(ethIn);
         assertEq(quoted, q.tokensOut, "quote");
         uint256 p0 = hook.pending();
