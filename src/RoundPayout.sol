@@ -26,7 +26,8 @@ interface IERC20 {
 ///           successful `payRound` and never flips back.
 ///         - `rounds(roundId).totalPaid` counts only legs that actually transferred (initial batch
 ///           plus successful retries); failed legs are held in `failed(roundId, to)` until retried
-///           or written off, and `rounds(roundId).failedCount` is the number of legs still failed.
+///           or written off, and `rounds(roundId).failedCount` counts distinct recipients with
+///           nonzero amounts still owed. Failed zero-amount legs emit PayFailed but create no debt.
 ///         - `payRound` reverts up front when sum(amounts) exceeds the contract's token balance,
 ///           so a batch that starts always has enough to pay every leg.
 ///         - sum of all `Paid` amounts of a token <= sum of everything ever received in that token.
@@ -233,7 +234,6 @@ contract RoundPayout {
 
         uint256 failedCount;
         (totalPaid, failedCount) = _payLegs(roundId, token, to, amounts);
-        if (failedCount == n) revert AllTransfersFailed(roundId);
 
         round.token = token;
         round.paidAt = block.timestamp;
@@ -244,24 +244,34 @@ contract RoundPayout {
         emit RoundPaid(roundId, token, ledgerHash, twapCloseX96, totalEligibleLoss, totalPaid, n);
     }
 
-    /// @dev Sends every leg with a low-level try; failed legs are recorded and emitted, never revert.
+    /// @dev Records failed debts per recipient; reverts only if no transfer call succeeded.
     function _payLegs(uint256 roundId, address token, address[] calldata to, uint256[] calldata amounts)
         private
         returns (uint256 totalPaid, uint256 failedCount)
     {
+        bool anySucceeded;
         for (uint256 i = 0; i < to.length; ++i) {
             address recipient = to[i];
             uint256 amount = amounts[i];
             (bool ok, bytes memory reason) = _tryTransfer(token, recipient, amount);
             if (ok) {
+                anySucceeded = true;
                 totalPaid += amount;
                 emit Paid(roundId, recipient, amount);
             } else {
-                failed[roundId][recipient] += amount;
-                ++failedCount;
-                emit PayFailed(roundId, recipient, amount, reason);
+                failedCount += _recordFailure(roundId, recipient, amount, reason);
             }
         }
+        if (!anySucceeded) revert AllTransfersFailed(roundId);
+    }
+
+    function _recordFailure(uint256 roundId, address recipient, uint256 amount, bytes memory reason)
+        private
+        returns (uint256 newRecipient)
+    {
+        if (amount != 0 && failed[roundId][recipient] == 0) newRecipient = 1;
+        failed[roundId][recipient] += amount;
+        emit PayFailed(roundId, recipient, amount, reason);
     }
 
     function _sum(uint256[] calldata amounts) private pure returns (uint256 total) {

@@ -409,14 +409,18 @@ abstract contract HookFixture {
         return imdIs0 ? a1 : a0;
     }
 
-    /// @dev The IMD leg the hook defines for each case, given the amount and the mock pool's deltas.
-    function _expectedLeg(uint8 c, uint256 amount, MockPoolManager.SwapResult memory r)
-        internal
-        view
-        returns (uint256)
-    {
-        if (c == 1 || c == 4) return amount;
+    /// @dev The pool movement, independent of the trader's swap encoding.
+    function _expectedLeg(MockPoolManager.SwapResult memory r) internal view returns (uint256) {
         return _abs(_imdSide(r.pool0, r.pool1));
+    }
+
+    function _expectedFee(uint8 c, uint256 amount, uint256 leg, uint256 bps) internal pure returns (uint256) {
+        if (c == 1) return amount * BASE / (BPS + BASE);
+        if (c == 4) {
+            uint256 rate = BASE + bps;
+            return (amount * rate + BPS - rate - 1) / (BPS - rate);
+        }
+        return leg * BASE / BPS + (c == 3 ? leg * bps / BPS : 0);
     }
 
     function _surchargeAt(uint256 elapsed) internal pure returns (uint256) {
@@ -463,8 +467,8 @@ contract HookHandler is HookFixture {
         vm.warp(block.timestamp + (warpBy % 4000));
         uint256 bps = hook.currentSurchargeBps();
         MockPoolManager.SwapResult memory r = pm.swap(key, _params(c, amount));
-        uint256 leg = _expectedLeg(c, amount, r);
-        uint256 fee = leg * BASE / BPS + (_isSell(c) ? leg * bps / BPS : 0);
+        uint256 leg = _expectedLeg(r);
+        uint256 fee = _expectedFee(c, amount, leg, bps);
         require(_imdSide(r.hook0, r.hook1) == int256(fee), "handler: hook IMD delta != fee");
         if (_abs(_tokenSide(r.hook0, r.hook1)) > maxTokenSideHookDelta) {
             maxTokenSideHookDelta = _abs(_tokenSide(r.hook0, r.hook1));
@@ -748,10 +752,8 @@ contract MoneyBackHookTest is HookFixture {
 
         MockPoolManager.SwapResult memory r = pm.swap(key, _params(c, amount));
 
-        uint256 leg = _expectedLeg(c, amount, r);
-        uint256 base = leg * BASE / BPS;
-        uint256 sur = _isSell(c) ? leg * bps / BPS : 0;
-        uint256 fee = base + sur;
+        uint256 leg = _expectedLeg(r);
+        uint256 fee = _expectedFee(c, amount, leg, bps);
 
         // Fee taken in IMD only, exactly base + surcharge, by one callback only.
         assertEq(_imdSide(r.hook0, r.hook1), int256(fee), "hook IMD delta == fee");
@@ -768,9 +770,9 @@ contract MoneyBackHookTest is HookFixture {
         assertEq(hook.pending(), pendingBefore + fee, "pending grows by fee");
         assertEq(pm.balanceOf(address(hook), _tokenId()), 0, "no MONEYBACK claims");
 
-        // Combined fee is within 1 wei of floor(leg * (425 + bps) / 10_000).
+        // Every swap form uses the actual pool leg, within the documented integer rounding.
         uint256 combined = leg * (BASE + (_isSell(c) ? bps : 0)) / BPS;
-        assertTrue(combined >= fee && combined - fee <= 1, "fee within 1 wei of combined formula");
+        assertTrue(_abs(int256(combined) - int256(fee)) <= 1, "fee within 1 wei of pool-leg rate");
 
         _checkSwapperAmounts(c, amount, leg, fee, r);
     }
@@ -879,11 +881,15 @@ contract MoneyBackHookTest is HookFixture {
         uint256 amount = 1_000e18;
         // Case 1 at t0: buy, no surcharge.
         vm.expectEmit(true, false, false, true);
-        emit FeeAccrued(false, amount * 425 / BPS, 0, amount);
+        uint256 buyFee = _expectedFee(1, amount, 0, 0);
+        emit FeeAccrued(false, buyFee, 0, amount - buyFee);
         pm.swap(key, _params(1, amount));
         // Case 4 at t0: sell, 20% surcharge.
         vm.expectEmit(true, false, false, true);
-        emit FeeAccrued(true, amount * 425 / BPS, amount * 2000 / BPS, amount);
+        uint256 sellFee = _expectedFee(4, amount, 0, 2000);
+        uint256 sellLeg = amount + sellFee;
+        uint256 base = sellLeg * BASE / BPS;
+        emit FeeAccrued(true, base, sellFee - base, sellLeg);
         pm.swap(key, _params(4, amount));
         // Case 3 at +900: leg is the pool's IMD out, 10% surcharge.
         vm.warp(T0 + 900);
@@ -927,7 +933,8 @@ contract MoneyBackHookTest is HookFixture {
             vm.warp(T0 + ts[i]);
             uint256 amount = 100e18;
             vm.expectEmit(true, false, false, true);
-            emit FeeAccrued(false, amount * 425 / BPS, 0, amount);
+            uint256 buyFee = _expectedFee(1, amount, 0, 0);
+            emit FeeAccrued(false, buyFee, 0, amount - buyFee);
             pm.swap(key, _params(1, amount));
         }
     }
@@ -958,7 +965,10 @@ contract MoneyBackHookTest is HookFixture {
         vm.warp(T0 + 1799);
         uint256 amount = 100_000e18;
         vm.expectEmit(true, false, false, true);
-        emit FeeAccrued(true, amount * 425 / BPS, amount * 1 / BPS, amount);
+        uint256 fee = _expectedFee(4, amount, 0, 1);
+        uint256 leg = amount + fee;
+        uint256 base = leg * BASE / BPS;
+        emit FeeAccrued(true, base, fee - base, leg);
         pm.swap(key, _params(4, amount));
     }
 
@@ -966,7 +976,8 @@ contract MoneyBackHookTest is HookFixture {
         vm.warp(T0 + 1800);
         uint256 amount = 100_000e18;
         vm.expectEmit(true, false, false, true);
-        emit FeeAccrued(true, amount * 425 / BPS, 0, amount);
+        uint256 fee = _expectedFee(4, amount, 0, 0);
+        emit FeeAccrued(true, fee, 0, amount + fee);
         pm.swap(key, _params(4, amount));
     }
 
@@ -1002,15 +1013,16 @@ contract MoneyBackHookTest is HookFixture {
     }
 
     /// forge-config: default.fuzz.runs = 512
-    function testFuzz_tinyAmountsRoundDownToZeroFee(uint8 c, uint256 amount, uint32 elapsed) public {
+    function testFuzz_tinyAmountsRespectRoundingBounds(uint8 c, uint256 amount, uint32 elapsed) public {
         c = uint8(c % 4) + 1;
-        amount = amount % 23 + 1; // 23 * 425 / 10_000 == 0 and 23 * 2000 / 10_000 == 4 at most
+        amount = amount % 23 + 1; // Exercise sub-wei proportional fees, including exact-output gross-up.
         vm.warp(T0 + elapsed);
         MockPoolManager.SwapResult memory r = pm.swap(key, _params(c, amount));
-        uint256 leg = _expectedLeg(c, amount, r);
-        uint256 expected = leg * BASE / BPS + (_isSell(c) ? leg * hook.currentSurchargeBps() / BPS : 0);
-        assertEq(hook.pending(), expected, "rounded-down fee");
-        assertTrue(expected <= 4, "base part always 0 at these sizes");
+        uint256 leg = _expectedLeg(r);
+        uint256 expected = _expectedFee(c, amount, leg, hook.currentSurchargeBps());
+        assertEq(hook.pending(), expected, "rounded fee");
+        assertTrue(expected <= 8, "bounded tiny fee");
+        if (c == 1) assertEq(expected, 0, "tiny buy not consumed by fee");
         assertEq(_tokenSide(r.hook0, r.hook1), 0, "no MONEYBACK delta");
     }
 
@@ -1025,7 +1037,7 @@ contract MoneyBackHookTest is HookFixture {
         pm.swap(key, _params(1, a));
         pm.swap(key, _params(4, c));
         uint256 leg3 = _abs(_imdSide(r3.pool0, r3.pool1));
-        uint256 expected = a * BASE / BPS + (leg3 * BASE / BPS + leg3 * bps / BPS) + (c * BASE / BPS + c * bps / BPS);
+        uint256 expected = _expectedFee(1, a, 0, bps) + _expectedFee(3, b, leg3, bps) + _expectedFee(4, c, 0, bps);
         assertEq(hook.pending(), expected, "pending == sum of fees");
     }
 
@@ -1122,8 +1134,10 @@ contract MoneyBackHookTest is HookFixture {
         (, BeforeSwapDelta d2,) = hook.beforeSwap(address(this), key, _params(2, 1e18), "");
         (, BeforeSwapDelta d3,) = hook.beforeSwap(address(this), key, _params(3, 1e18), "");
         // This fixture has IMD as currency0. Deltas are before applying the hook's fee.
-        BalanceDelta buy = BalanceDelta.wrap(int256(-0.9575e18) << 128 | int256(0.94e18));
-        BalanceDelta sell = BalanceDelta.wrap(int256(1.2425e18) << 128 | int256(uint256(uint128(int128(-1.26e18)))));
+        uint256 buyLeg = 1e18 - _expectedFee(1, 1e18, 0, 2000);
+        uint256 sellLeg = 1e18 + _expectedFee(4, 1e18, 0, 2000);
+        BalanceDelta buy = BalanceDelta.wrap(-int256(buyLeg) << 128 | int256(0.94e18));
+        BalanceDelta sell = BalanceDelta.wrap(int256(sellLeg) << 128 | int256(uint256(uint128(int128(-1.26e18)))));
         (, int128 u1) = hook.afterSwap(address(this), key, _params(1, 1e18), buy, "");
         (, int128 u4) = hook.afterSwap(address(this), key, _params(4, 1e18), sell, "");
         vm.stopPrank();
@@ -1137,7 +1151,7 @@ contract MoneyBackHookTest is HookFixture {
     function testFuzz_specifiedOneWeiUnderfillAlwaysRefused(uint96 raw, uint32 elapsed, bool sell) public {
         uint256 amount = uint256(raw) % 1e24 + 1;
         vm.warp(T0 + uint256(elapsed) % 3601);
-        uint256 fee = amount * 425 / BPS + (sell ? amount * hook.currentSurchargeBps() / BPS : 0);
+        uint256 fee = _expectedFee(sell ? 4 : 1, amount, 0, hook.currentSurchargeBps());
         int256 expected = sell ? int256(amount + fee) : -int256(amount - fee);
         // Fixture IMD is currency0. One raw unit missing is a partial fill even if the fee rounds to zero.
         int256 filled = sell ? expected - 1 : expected + 1;
@@ -1159,6 +1173,33 @@ contract MoneyBackHookTest is HookFixture {
         vm.prank(address(pm));
         vm.expectRevert(abi.encodeWithSelector(MoneyBackHook.AmountOverflow.selector));
         hook.beforeSwap(address(this), key, p, "");
+    }
+
+    function test_exactOutputGrossLegOverflowRevertsBeforeMint() public {
+        uint256 maxLeg = uint256(uint128(type(int128).max));
+        pm.setUnlocked(true);
+        vm.prank(address(pm));
+        vm.expectRevert(abi.encodeWithSelector(MoneyBackHook.AmountOverflow.selector));
+        hook.beforeSwap(address(this), key, _params(4, maxLeg), "");
+        assertEq(hook.pending(), 0, "overflow mints no claims");
+    }
+
+    function test_specifiedFeesAtInt128Boundary() public {
+        uint256 maxLeg = uint256(uint128(type(int128).max));
+        uint256 netOutput = maxLeg * (BPS - BASE - 2000) / BPS;
+        pm.setUnlocked(true);
+        vm.prank(address(pm));
+        (, BeforeSwapDelta d,) = hook.beforeSwap(address(this), key, _params(4, netOutput), "");
+        uint256 sellFee = uint256(BeforeSwapDelta.unwrap(d) >> 128);
+        uint256 leg = netOutput + sellFee;
+        assertTrue(leg <= maxLeg, "gross sell leg fits int128");
+        assertEq(sellFee, (leg * (BASE + 2000) + BPS - 1) / BPS, "sell rate at maximum leg");
+        vm.prank(address(pm));
+        (, d,) = hook.beforeSwap(address(this), key, _params(1, maxLeg), "");
+        uint256 buyFee = uint256(BeforeSwapDelta.unwrap(d) >> 128);
+        uint256 floored = (maxLeg - buyFee) * BASE / BPS;
+        assertTrue(buyFee <= floored && floored - buyFee <= 1, "buy rate at maximum leg");
+        assertEq(hook.pending(), sellFee + buyFee, "claims equal deltas at bounds");
     }
 
     function test_hookNeverMintsMoneybackClaimsEvenIfGiftedImdClaims() public {

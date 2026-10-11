@@ -623,14 +623,14 @@ abstract contract RouterFixture {
     // ------------------------------------------------------------------ expected amounts
 
     /// @dev What a buy of `ethIn` must do, given the mock pools' rates, LP fees, caps and the hook's
-    ///      exact-input buy rule (fee = floor(IMD offered * 425 / 10_000), taken before the pool swaps).
+    ///      exact-input buy rule (fee = floor(IMD offered * 425 / 10_425), taken before the pool swaps).
     function _buyMath(uint256 ethIn) internal view returns (BuyMath memory q) {
         uint256 capPub = pm.capOf(publicId);
         uint256 capL = pm.capOf(launchId);
         q.ethUsed = capPub != 0 ? _min(ethIn, capPub) : ethIn;
         q.imdOut = q.ethUsed * (PIPS - PUBLIC_FEE) / PIPS * RATE;
         if (q.imdOut == 0) return q;
-        q.fee = q.imdOut * BASE / BPS;
+        q.fee = q.imdOut * BASE / (BPS + BASE);
         uint256 poolIn = q.imdOut - q.fee;
         if (capL != 0) poolIn = _min(poolIn, capL);
         q.tokensOut = poolIn * (PIPS - LAUNCH_FEE) / PIPS;
@@ -1015,11 +1015,11 @@ contract MoneyBackRouterTest is RouterFixture {
         assertEq(token.balanceOf(address(pm)), pmTok - q.tokensOut, "manager paid the MONEYBACK");
         assertEq(_imdOf(address(pm)), pmImd, "IMD never left the manager");
         assertEq(hook.pending(), pendingBefore + q.fee, "hook accrued 4.25% of the IMD leg");
-        assertEq(q.fee, q.imdOut * 425 / 10_000, "fee is 4.25% of IMD bought");
-        // Concrete numbers: 1 ETH -> 990 IMD -> fee 42.075 IMD -> pool 947.925 IMD -> 1.25% LP -> 936.075937... MONEYBACK
+        assertEq(q.fee, q.imdOut * 425 / 10_425, "fee inverted from pool IMD input");
+        // 1 ETH -> 990 IMD; the gross IMD splits into pool input plus 4.25% of that input.
         assertEq(q.imdOut, 990e18, "IMD after 1% public LP fee");
-        assertEq(q.fee, 42_075e15, "4.25% of 990");
-        assertEq(q.tokensOut, 947_925e15 * (PIPS - LAUNCH_FEE) / PIPS, "MONEYBACK out");
+        assertEq(q.fee, 40_359712230215827338, "fee on pool input");
+        assertEq(q.tokensOut, (990e18 - q.fee) * (PIPS - LAUNCH_FEE) / PIPS, "MONEYBACK out");
         _assertRouterEmpty();
     }
 
@@ -1080,7 +1080,7 @@ contract MoneyBackRouterTest is RouterFixture {
         uint256 directFee = hook.pending() - p1;
 
         assertEq(routerFee, directFee, "router buy and direct buy pay the same hook fee");
-        assertEq(routerFee, q.imdOut * 425 / 10_000, "4.25% of the IMD leg");
+        assertEq(routerFee, q.imdOut * 425 / 10_425, "4.25% of the IMD leg");
         assertEq(viaRouter, viaDirect, "same MONEYBACK for the same IMD");
         assertEq(token.balanceOf(address(direct)), viaDirect, "direct buyer got its tokens");
         assertEq(_imdOf(address(direct)), 0, "direct buyer spent all its IMD");
@@ -1155,14 +1155,34 @@ contract MoneyBackRouterTest is RouterFixture {
         assertEq(h1, 0, "no hook data");
     }
 
+    function test_directTokenGiftsRemainUnrecoverable() public {
+        vm.prank(ALICE);
+        token.transfer(address(router), 1);
+        MockImdToken(IMD_ADDR).mint(address(router), 2);
+        _buyAs(ALICE, 1 ether, 1, block.timestamp);
+        _sellAs(ALICE, 100e18, 1, block.timestamp);
+        require(router.quoteBuy(1 ether) > 0 && router.quoteSell(100e18) > 0, "quotes work");
+        assertEq(token.balanceOf(address(router)), 1, "direct MONEYBACK retained");
+        assertEq(_imdOf(address(router)), 2, "direct IMD retained");
+    }
+
+    function test_forcedEthGoesToNextTrader() public {
+        // Model ETH forced into the router without receive(); ordinary sends are tested separately.
+        vm.deal(address(router), 1);
+        uint256 beforeEth = ALICE.balance;
+        _buyAs(ALICE, 1 ether, 1, block.timestamp);
+        assertEq(ALICE.balance, beforeEth - 1 ether + 1, "forced wei returned to trader");
+        assertEq(address(router).balance, 0, "all ETH forwarded");
+    }
+
     function test_buyThenSellRoundTrip() public {
         uint256 bought = _buyAs(ALICE, 10 ether, 0, block.timestamp);
         vm.warp(T0 + 3600);
         uint256 ethBack = _sellAs(ALICE, bought, 0, block.timestamp);
         assertEq(ethBack, _sellMath(bought).ethOut, "sell maths");
         assertTrue(ethBack < 10 ether, "fees were paid");
-        // buy 0.99 * 0.9575 * 0.9875, sell 0.9875 * 0.9575 * 0.99: 0.93608^2 ~= 0.8762
-        assertTrue(ethBack > 8.76 ether && ethBack < 8.77 ether, "round trip loses about 12.4%");
+        // buy 0.99 / 1.0425 * 0.9875; sell 0.9875 * 0.9575 * 0.99: about 0.87782.
+        assertTrue(ethBack > 8.77 ether && ethBack < 8.78 ether, "round trip loses about 12.2%");
         assertEq(token.balanceOf(ALICE), 10_000_000e18, "all bought tokens sold");
         _assertRouterEmpty();
     }
@@ -1758,8 +1778,8 @@ contract MoneyBackRouterTest is RouterFixture {
             assertEq(out, q.tokensOut, "tokens");
             assertEq(ALICE.balance, 1_000_000 ether - q.ethUsed, "ETH spent == consumed");
             assertEq(_imdOf(ALICE), q.imdDust, "IMD dust");
-            assertEq(hook.pending() - p0, q.fee, "fee == floor(imdOut * 425 / 10000)");
-            assertEq(q.fee, q.imdOut * 425 / BPS, "buys never surcharged");
+            assertEq(hook.pending() - p0, q.fee, "fee == floor(imdOut * 425 / 10425)");
+            assertEq(q.fee, q.imdOut * 425 / (BPS + BASE), "buys never surcharged");
         }
         _assertRouterEmpty();
     }

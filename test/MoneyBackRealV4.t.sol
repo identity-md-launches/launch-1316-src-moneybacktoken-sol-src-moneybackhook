@@ -22,6 +22,8 @@ interface VmRealV4 {
     function warp(uint256) external;
     function deal(address, uint256) external;
     function expectRevert(bytes calldata) external;
+    function snapshotState() external returns (uint256);
+    function revertToState(uint256) external returns (bool);
 }
 
 interface IERC20RealV4 {
@@ -183,6 +185,85 @@ abstract contract RealV4Fixture is IUnlockCallback {
         return leg * 425 / 10_000 + (sell ? leg * hook.currentSurchargeBps() / 10_000 : 0);
     }
 
+    /// @dev Assert the fee against the observed pool leg, without using the inverse pricing formula.
+    function _assertPoolLegFee(bool sell, bool specified, uint256 leg, uint256 charged) internal view {
+        uint256 floored = _fee(sell, leg);
+        if (!specified) {
+            require(charged == floored, "actual pool delta fee");
+        } else if (sell) {
+            require(charged >= floored && charged - floored <= 2, "sell gross-up rounding bound");
+            uint256 numerator = leg * (425 + hook.currentSurchargeBps());
+            require(charged * 10_000 >= numerator && charged * 10_000 - numerator < 10_000, "sell pool-leg rate");
+        } else {
+            require(charged <= floored && floored - charged <= 1, "buy rounding bound");
+        }
+    }
+
+    function _assertEquivalentTrades(bool sell, uint256 amount) internal {
+        uint256 snap = vm.snapshotState();
+        uint256 beforeFee = hook.pending();
+        BalanceDelta first = _trade(_params(sell, !sell, amount, false));
+        uint256 firstFee = hook.pending() - beforeFee;
+        uint256 firstPoolLeg = sell ? uint256(_imd(first)) + firstFee : uint256(-_imd(first)) - firstFee;
+        uint256 tokenAmount = uint256(sell ? -_moneyback(first) : _moneyback(first));
+        require(_imd(first) == (sell ? int256(amount) : -int256(amount)), "specified IMD exact");
+        _assertPoolLegFee(sell, true, firstPoolLeg, firstFee);
+
+        require(vm.revertToState(snap), "snapshot restored");
+        BalanceDelta second = _trade(_params(sell, sell, tokenAmount, false));
+        uint256 secondFee = hook.pending() - beforeFee;
+        uint256 secondPoolLeg = sell ? uint256(_imd(second)) + secondFee : uint256(-_imd(second)) - secondFee;
+        require(_moneyback(first) == _moneyback(second), "same MONEYBACK movement");
+        require(firstPoolLeg + 2 >= secondPoolLeg && secondPoolLeg + 2 >= firstPoolLeg, "same pool IMD movement");
+        _assertPoolLegFee(sell, false, secondPoolLeg, secondFee);
+        // Inverse fee rounding (at most 2) plus v4's pool/LP rounding (at most 1 fee unit).
+        require(firstFee + 3 >= secondFee && secondFee + 3 >= firstFee, "same fee independent of swap form");
+    }
+
+    function test_equivalentBuysAndSellsAtDecayBoundaries() public {
+        uint256[5] memory elapsed = [uint256(0), 900, 1799, 1800, 3600];
+        for (uint256 i; i < elapsed.length; ++i) {
+            vm.warp(T0 + elapsed[i]);
+            _assertEquivalentTrades(false, 100e18);
+            _assertEquivalentTrades(true, 100e18);
+        }
+    }
+
+    function testFuzz_equivalentSwapForms(uint96 raw, uint32 elapsed, bool sell) public {
+        vm.warp(T0 + uint256(elapsed) % 3601);
+        _assertEquivalentTrades(sell, uint256(raw) % 1000e18 + 1e12);
+    }
+
+    function test_routerUnfillableBuyAndQuoteRevertAtomically() public {
+        PoolKey memory publicKey =
+            PoolKey(Currency.wrap(address(0)), Currency.wrap(IMD), 10_000, 100, IHooks(address(0)));
+        manager.initialize(publicKey, Q96);
+        _liquidity(publicKey, -600, 600, 1e27, 0);
+        uint256 smallQuote = router.quoteBuy(1 ether);
+        require(smallQuote > 0, "ordinary quote succeeds");
+        uint256 ethBefore = address(this).balance;
+        uint256 tokensBefore = token.balanceOf(address(this));
+        bytes memory expected = abi.encodeWithSelector(
+            CustomRevert.WrappedError.selector,
+            address(hook),
+            IHooks.afterSwap.selector,
+            abi.encodeWithSelector(MoneyBackHook.PartialFill.selector),
+            abi.encodeWithSelector(Hooks.HookCallFailed.selector)
+        );
+        vm.expectRevert(expected);
+        router.quoteBuy(100_000 ether);
+        vm.expectRevert(expected);
+        router.buyWithEth{value: 100_000 ether}(1, block.timestamp);
+        require(address(this).balance == ethBefore && token.balanceOf(address(this)) == tokensBefore, "no funds moved");
+        require(hook.pending() == 0, "no claims retained");
+        (uint160 launchPrice,,,) = IPoolManager(address(manager)).getSlot0(key.toId());
+        (uint160 publicPrice,,,) = IPoolManager(address(manager)).getSlot0(publicKey.toId());
+        require(launchPrice == Q96 && publicPrice == Q96, "both pools rolled back");
+        require(
+            router.buyWithEth{value: 1 ether}(smallQuote, block.timestamp) == smallQuote, "router usable after revert"
+        );
+    }
+
     function test_fullFillAllFourCasesAndSweep() public {
         for (uint256 elapsed; elapsed <= 1800; elapsed += 900) {
             vm.warp(T0 + elapsed);
@@ -197,11 +278,9 @@ abstract contract RealV4Fixture is IUnlockCallback {
                 require(sell ? _moneyback(delta) < 0 : _moneyback(delta) > 0, "MONEYBACK direction");
                 if (sell != exactInput) {
                     require(imdDelta == (sell ? int256(100e18) : -int256(100e18)), "full specified amount");
-                    require(charged == _fee(sell, 100e18), "specified fee");
-                } else {
-                    uint256 poolLeg = sell ? uint256(imdDelta) + charged : uint256(-imdDelta) - charged;
-                    require(charged == _fee(sell, poolLeg), "actual delta fee");
                 }
+                uint256 poolLeg = sell ? uint256(imdDelta) + charged : uint256(-imdDelta) - charged;
+                _assertPoolLegFee(sell, sell != exactInput, poolLeg, charged);
             }
         }
         uint256 pending = hook.pending();
@@ -270,11 +349,13 @@ abstract contract RealV4Fixture is IUnlockCallback {
         require(IntegrationIMD(IMD).balanceOf(address(manager)) == 0, "pool must start without IMD");
         BalanceDelta delta = _trade(_params(false, true, 100e18, false));
         require(_imd(delta) == -int256(100e18) && _moneyback(delta) > 0, "single sided buy");
-        require(hook.pending() == 4.25e18, "claim accrued before router settled");
+        uint256 fee = hook.pending();
+        require(fee > 0, "claim accrued before router settled");
+        _assertPoolLegFee(false, true, 100e18 - fee, fee);
         uint256 beforePayout = IntegrationIMD(IMD).balanceOf(PAYOUT);
         hook.sweep();
         require(hook.pending() == 0, "claim redeemed");
-        require(IntegrationIMD(IMD).balanceOf(PAYOUT) - beforePayout == 4.25e18, "fee remains IMD");
+        require(IntegrationIMD(IMD).balanceOf(PAYOUT) - beforePayout == fee, "fee remains IMD");
     }
 
     function test_singleSidedPoolRejectsUnfillableExactOutputSell() public {
@@ -290,7 +371,7 @@ abstract contract RealV4Fixture is IUnlockCallback {
         require(hook.pending() == 0, "LP deposit has no swap fee");
         _trade(_params(false, true, 10_000e18, false));
         uint256 buyersFee = hook.pending();
-        require(buyersFee == 425e18, "buyer still pays swap fee");
+        _assertPoolLegFee(false, true, 10_000e18 - buyersFee, buyersFee);
         BalanceDelta withdrawn = _liquidity(key, lower, upper, -100_000e18, bytes32(uint256(1)));
         require(_moneyback(withdrawn) == 0 && _imd(withdrawn) > 0, "LP converted token to IMD");
         require(hook.pending() == buyersFee, "LP withdrawal does not pay surcharge");
@@ -325,7 +406,8 @@ abstract contract RealV4Fixture is IUnlockCallback {
         vm.warp(T0 + uint256(elapsed) % 3601);
         BalanceDelta delta = _trade(_params(sell, !sell, amount, false));
         require(_imd(delta) == (sell ? int256(amount) : -int256(amount)), "specified fill");
-        require(hook.pending() == _fee(sell, amount), "specified fee preserved");
+        uint256 fee = hook.pending();
+        _assertPoolLegFee(sell, true, sell ? amount + fee : amount - fee, fee);
     }
 }
 

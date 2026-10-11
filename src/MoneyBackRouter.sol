@@ -45,9 +45,9 @@ interface IRouterPoolManager is IPoolManager {
 ///         surcharge) apply exactly as they would to a direct IMD trade; the router adds no fee.
 ///
 ///         Invariants:
-///         - The router holds nothing between calls: every call ends by taking all MONEYBACK and
-///           any IMD or ETH left over to msg.sender. Its ETH, IMD and MONEYBACK balances (and its
-///           PoolManager deltas) are zero after every call.
+///         - Each trade returns its proceeds and unused input to msg.sender and settles all its
+///           PoolManager deltas. ERC-20s sent directly to this contract have no rescue path;
+///           any forced ETH balance is included in the next trader's ETH payment or refund.
 ///         - It never approves anyone for anything: sellers' MONEYBACK is pulled from msg.sender
 ///           before unlock, then the consumed amount is settled from the router's own balance.
 ///         - No owner, no setter, no pause, no upgrade, no selfdestruct.
@@ -194,8 +194,8 @@ contract MoneyBackRouter is IUnlockCallback {
     // ---------------------------------------------------------------------------------------------
 
     /// @notice Swaps all of msg.value ETH -> IMD -> MONEYBACK and sends the MONEYBACK to msg.sender.
-    ///         Any ETH the public pool did not consume and any IMD our pool did not consume are
-    ///         refunded to msg.sender in the same call.
+    ///         Any ETH the public pool did not consume is refunded to msg.sender. The launch leg
+    ///         must consume all intermediate IMD, including its hook fee, or the entire call reverts.
     /// @param minTokensOut Reverts with InsufficientOutput if fewer MONEYBACK would be received (or none).
     /// @param deadline     Reverts with Expired once block.timestamp is past it.
     /// @return tokensOut   MONEYBACK sent to msg.sender.
@@ -243,7 +243,8 @@ contract MoneyBackRouter is IUnlockCallback {
     // ---------------------------------------------------------------------------------------------
 
     /// @notice MONEYBACK that buyWithEth would send for `ethIn` right now, hook fee included.
-    ///         Returns 0 when the route yields nothing (buyWithEth would revert).
+    ///         Returns 0 for zero input or a completed simulation yielding no output. Other failures
+    ///         propagate, including the hook's wrapped PartialFill when the launch leg cannot fill.
     /// @dev Runs both swaps for real inside an unlock that always reverts, so nothing is changed.
     ///      Not typed `view` because the PoolManager writes transient storage during a swap and
     ///      rejects it under STATICCALL; call it with eth_call off-chain.
@@ -254,7 +255,7 @@ contract MoneyBackRouter is IUnlockCallback {
     }
 
     /// @notice ETH that sellForEth would send for `tokens` right now, hook fee and surcharge included.
-    ///         Returns 0 when the route yields nothing (sellForEth would revert).
+    ///         Returns 0 for zero input or a completed simulation yielding no output; other failures propagate.
     /// @dev See quoteBuy: not `view`, state-neutral, meant for eth_call.
     function quoteSell(uint256 tokens) external returns (uint256 ethOut) {
         _enter();
@@ -297,7 +298,7 @@ contract MoneyBackRouter is IUnlockCallback {
     // ---------------------------------------------------------------------------------------------
 
     /// @dev ETH -> IMD on the public pool, IMD -> MONEYBACK on our pool. For a real buy, settles the
-    ///      ETH consumed, takes the MONEYBACK and any IMD left over to the user. A quote only swaps.
+    ///      ETH consumed and takes MONEYBACK to the user. The launch leg must fully fill. A quote only swaps.
     function _buy(CallbackData memory d) private returns (Result memory r) {
         bool quote = d.action == Action.QuoteBuy;
 
@@ -322,8 +323,6 @@ contract MoneyBackRouter is IUnlockCallback {
         if (quote) return r;
 
         poolManager.take(Currency.wrap(token), d.user, r.amountOut);
-        uint256 imdDust = imdOut - r.imdMid; // leg 2 can consume less than it was offered
-        if (imdDust != 0) poolManager.take(Currency.wrap(IMD), d.user, imdDust);
     }
 
     /// @dev MONEYBACK -> IMD on our pool, IMD -> ETH on the public pool. For a real sell, settles

@@ -2,14 +2,16 @@
 
 Launch preparation for Robinhood Chain **4663**, paired with IMD. Website: https://imdmoneyback.xyz · X: https://x.com/IMDmoneyback.
 
-The four supplied contracts came from swarm jobs `57052175` and `cb7160d0`. This revision repairs the imported partial-fill fee issue and router payment pattern, supplies a protocol-compatible manifest and a separate auxiliary deployment script, and preserves the requested fee constants, permissions, token supply and ownership. `MoneyBackToken.sol` and `RoundPayout.sol` are unchanged. No transaction has been broadcast by this work.
+The four supplied contracts came from swarm jobs `57052175` and `cb7160d0`. The earlier round supplied the partial-fill protection, router payment repair and separate auxiliary deployment script. This revision makes the hook fee use the pool's IMD movement in all swap forms, repairs RoundPayout's duplicate-failure counter, and corrects the router's partial-fill documentation. Fee constants, decay, permissions, token supply and ownership are unchanged. No transaction has been broadcast by this work.
 
 ## Deliverables and checks
 
 - [launch.json](launch.json): installed IMD `univ4_hook` format, deploying the token and hook.
 - [DeployAuxiliaries.s.sol](script/DeployAuxiliaries.s.sol): deploys RoundPayout and MoneyBackRouter after the factory launch, with explicit address validation.
 - [Requester share](docs/requester-share.json): the protocol's two-field requester-share input, for the launch service; **not an additional launch manifest** and not automatically consumed by `launch.json`.
-- [Audit responses](docs/AUDIT_RESPONSES.md): disposition of all eight imported entries, test evidence and validation limits.
+- [Revision responses](.imd-responses.json): disposition of all fourteen supplied findings.
+- [Revision evidence](docs/REVISION.md): reproductions, fixes, rounding and current validation.
+- [Earlier audit responses](docs/AUDIT_RESPONSES.md): the previous round's evidence and validation limits.
 - [Network observations](docs/network-observations.json): pinned, read-only checks of IMD and the public ETH/IMD pool.
 - [PNG logo](assets/moneyback.png) and [SVG source](assets/moneyback.svg): one large, centered open umbrella with a hooked handle, `#FFC83D` on a full-square `#17356B` background. The PNG is 1024 × 1024 RGB; no text, rain, border or gradient.
 
@@ -62,6 +64,8 @@ The installed hook manifest has no economics fields. The launch service must car
 
 The hook binds one pool and accepts callbacks only from its immutable PoolManager. It has no owner, fee setter, payout setter, pause, upgrade or arbitrary execution function. The token and router also have no administrative powers.
 
+`imdLeg` always means the actual IMD moved by the pool, excluding the hook fee. It includes the pool's LP fee when IMD is the input. For IMD-unspecified trades (exact-output buys and exact-input sells):
+
 ```text
 baseFee   = floor(imdLeg * 425 / 10000)
 sellBps   = floor(2000 * max(0, 1800 - elapsedSeconds) / 1800)
@@ -69,20 +73,34 @@ surcharge = isSell ? floor(imdLeg * sellBps / 10000) : 0
 hookFee   = baseFee + surcharge
 ```
 
-Elapsed time starts at pool initialization and uses `block.timestamp`. The surcharge is 2000 bps initially, 1000 at +900 seconds, and 0 from +1800 seconds onward. Buys never incur it. The two fee components round down separately. The 1.25% pool LP fee is separate and is never overridden.
+Elapsed time starts at pool initialization and uses `block.timestamp`. The surcharge is 2000 bps initially, 1000 at +900 seconds, and 0 from +1800 seconds onward. Buys never incur it. The 1.25% pool LP fee is separate and is never overridden.
+
+For IMD-specified trades, `A = abs(amountSpecified)` is the trader's gross buy input or net sell output, so the fee must be inverted:
+
+```text
+Exact-input buy:   F = floor(A * 425 / 10425);           imdLeg = A - F
+Exact-output sell: F = ceil(A * r / (10000 - r));        imdLeg = A + F
+                  r = 425 + sellBps
+```
+
+Specified buys round down so a tiny input cannot be wholly consumed by the hook; specified sells round up to cover the rate on the gross pool output while delivering exactly `A`. Compared with separately flooring both components on the actual pool leg, this differs by at most **1 IMD wei on buys and 2 IMD wei on sells**. While a sell surcharge is active, `FeeAccrued.baseFeeImd` is the floored base fee on the pool leg and `surchargeImd` is the remainder of `F`; after decay, all of `F` is base fee. The event's `imdLeg` is the pool movement in every case.
+
+For example, an exact-input buy paying 100 IMD splits into about 95.92326139 IMD pool input plus 4.07673861 IMD fee. An exact-output sell receiving 100 IMD at initialization requires about 132.01320132 IMD pool output, of which 32.01320132 IMD is the 24.25% hook fee. Encoding the same MONEYBACK movement as the other swap form changes the fee only by integer rounding.
 
 | Swap | IMD leg and fee treatment | Partial fills |
 | --- | --- | --- |
-| Exact-input buy | Offered IMD is the leg; hook takes 4.25%, pool consumes the remainder | Reverts `PartialFill` unless the adjusted IMD input is completely consumed |
+| Exact-input buy | Pool consumes `A - F`; fee is 4.25% of that pool input, with inversion rounding above | Reverts `PartialFill` unless the adjusted IMD input is completely consumed |
 | Exact-output buy | Actual pool IMD input is the leg; fee is added to that input | Fee reflects actual fill; caller must enforce required MONEYBACK output |
 | Exact-input sell | Actual pool IMD output is the leg; base fee and surcharge are deducted | Allowed; fee reflects actual fill and unused MONEYBACK can be refunded |
-| Exact-output sell | Requested net IMD is the leg; pool must deliver that amount plus base fee and surcharge | Reverts `PartialFill` unless that entire gross IMD output is delivered |
+| Exact-output sell | Pool delivers `A + F`; base fee and surcharge are charged on that gross pool output | Reverts `PartialFill` unless that entire gross IMD output is delivered |
 
-The full-fill guard compares the actual pool IMD delta with `amountSpecified + beforeSwapFee`. Its fee calculation is deterministic within the transaction: constants, the pool's fixed initialization time and the same block timestamp. Recomputing the separately floored components avoids transient state and supports several swaps in one unlock. Reverting also rolls back all claims and both router legs. A quote for an unfillable IMD-specified swap reverts; use a smaller executable trade.
+The full-fill guard compares the actual pool IMD delta with `amountSpecified + beforeSwapFee`. Its fee calculation is deterministic within the transaction: constants, the pool's fixed initialization time and the same block timestamp. Recomputing the same inverted fee avoids transient state and supports several swaps in one unlock. Reverting also rolls back all claims and both router legs. A quote for an unfillable IMD-specified swap reverts; use a smaller executable trade.
 
 Fees accrue as ERC-6909 **IMD claims**, allowing first buys even when a pool seeded only with MONEYBACK has no IMD in the manager yet. Anyone can call `sweep()` outside an existing manager unlock. It burns the claims and transfers IMD only to the immutable paying wallet. If redemption fails, the transaction reverts and claims remain. The hook never sells fees for ETH, never charges MONEYBACK and never sends fees to RoundPayout automatically.
 
-The router's public route is native ETH / IMD, fee 10000, tick spacing 100, no hook. Its ETH conversions concern the **trader's input or proceeds**; hook fees remain in IMD. Sellers approve this router, which pulls only from `msg.sender` before unlocking, settles only consumed MONEYBACK from its own balance, and returns unused MONEYBACK afterward. It also refunds unused ETH and IMD where the relevant leg permits a partial fill. Set minimum output and deadline on every trade; quotes use `eth_call` and roll back their simulation.
+The router's public route is native ETH / IMD, fee 10000, tick spacing 100, no hook. Its ETH conversions concern the **trader's input or proceeds**; hook fees remain in IMD. Sellers approve this router, which pulls only from `msg.sender` before unlocking, settles only consumed MONEYBACK from its own balance, and returns unused MONEYBACK afterward. Buys refund unused ETH from the public leg; the launch leg must consume all intermediate IMD or both legs revert. Sells may refund unused MONEYBACK and IMD. Set minimum output and deadline on every trade; quotes use `eth_call` and roll back their simulation. A zero input or completed simulation with zero output quotes zero; other failures propagate, including the wrapped `PartialFill` from an unfillable launch buy.
+
+The router has no rescue function or owner. MONEYBACK or IMD transferred directly to it remains stuck; normal trades return only the funds attributable to those trades. ETH forced into the router without `receive()` is included in the next successful trader's ETH payment or refund.
 
 ### Scope of the surcharge
 
@@ -109,10 +127,10 @@ These shell variables are explicit run arguments, not values read by contracts o
 
 The paying wallet owns **only RoundPayout**. Any account can call the hook's `sweep()` and anyone can fund RoundPayout, but an operator must move swept IMD from the wallet into the payer: approve the actual RoundPayout address on IMD, then call `fund(IMD, amount)`. No pool, router or hook funding of rounds happens automatically.
 
-The engine runs off chain. Its operator determines eligible recipients, losses, round IDs, amounts, ledger hash and supplied price data; the payer does not validate an insurance entitlement or price oracle. The contract does not enforce a 15-minute schedule. Use unique recipients per batch, at most 500 entries, and sufficient funding; a completed round ID is idempotent. Monitor `Paid`, `PayFailed` and `RoundPaid`, retry failures with `retryFailed`, or explicitly write them off with `writeOffFailed`.
+The engine runs off chain. Its operator determines eligible recipients, losses, round IDs, amounts, ledger hash and supplied price data; the payer does not validate an insurance entitlement or price oracle. The contract does not enforce a 15-minute schedule. Use at most 500 entries and sufficient funding; a completed round ID is idempotent. Duplicate recipients are supported: failed amounts aggregate per address, and `rounds(roundId).failedCount` counts distinct recipients with nonzero debt. A successful retry or write-off clears that recipient once. Failed zero-amount legs emit `PayFailed` but create no debt. A batch whose every transfer call fails still reverts, even with duplicates; a successful zero-amount transfer counts as a success. Retry each outstanding recipient once per retry batch. Monitor `Paid`, `PayFailed` and `RoundPaid`, retry failures with `retryFailed`, or explicitly write them off with `writeOffFailed`.
 
-The RoundPayout owner can choose arbitrary recipients, amounts and ERC-20s, sweep its entire token balance anywhere (also while paused), pause/unpause new payments and retries, transfer ownership through the two-step handoff, or renounce it. Renouncing disables future owner operations. These powers do not alter the token, hook, router or holder balances. The owner is responsible for maintaining its signer, funding and operating the engine, reconciling actual transfers, publishing the ledger and monitoring claims/round failures. All contract bytecode remains immutable, including RoundPayout; its allowed owner operations affect its state, not its code.
+The RoundPayout owner can choose arbitrary recipients, amounts and ERC-20s, sweep its entire token balance anywhere (also while paused), pause/unpause new payments and retries, transfer ownership through the two-step handoff, or renounce it. Renouncing disables future owner operations and permanently strands any funded balances, including future third-party deposits; there is no permissionless recovery path. These powers do not alter the token, hook, router or holder balances. The owner is responsible for maintaining its signer, funding and operating the engine, reconciling actual transfers, publishing the ledger and monitoring claims/round failures. All contract bytecode remains immutable, including RoundPayout; its allowed owner operations affect its state, not its code.
 
 ## Worker-selected implementation choices
 
-The original brief fixes all economic values and the paying wallet. The worker selected atomic rejection of unsafe specified-currency partial fills, settlement from router-held caller funds, separate auxiliary deployment using the installed protocol's supported boundary, and vector artwork plus a 1024-pixel PNG. These are documented implementation choices, not new requester approvals. No market quote, external owner, launch address, key or signature was invented.
+The original brief fixes all economic values and the paying wallet. The earlier round selected atomic rejection of unsafe specified-currency partial fills, settlement from router-held caller funds, separate auxiliary deployment using the installed protocol's supported boundary, and vector artwork plus a 1024-pixel PNG. This revision adds pool-leg fee inversion with the explicit rounding above and counts outstanding payout recipients rather than failed legs. These are documented implementation choices, not new requester approvals. No market quote, external owner, launch address, key or signature was invented.

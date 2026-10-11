@@ -138,22 +138,28 @@ library Hooks {
 ///         and accrues it as PoolManager ERC-6909 claims owned by this contract. Anyone can call
 ///         `sweep()` to move everything accrued to the immutable paying wallet, `payout`.
 ///
-/// @dev FEE MATHS (all integer, all rounded down, all in IMD, never in MONEYBACK)
+/// @dev FEE MATHS (all integer, all in IMD, never in MONEYBACK)
+///      imdLeg always means the pool's actual IMD movement, excluding the hook fee.
+///      When IMD is unspecified, charge the observed leg:
 ///
 ///      baseFee      = floor(imdLeg * 425 / 10_000)                          every swap, both directions
 ///      surcharge    = floor(imdLeg * currentSurchargeBps() / 10_000)        sells only (MONEYBACK -> IMD)
 ///      hookFee      = baseFee + surcharge
 ///      surchargeBps = 2000 * max(0, 1800 - (block.timestamp - initializedAt)) / 1800
 ///
-///      Because the two parts are floored separately, hookFee can be 1 wei below
-///      floor(imdLeg * (425 + surchargeBps) / 10_000). The LP fee is never overridden: the pool
-///      charges its own 1.25% on the input side inside the swap as usual.
+///      When IMD is specified, invert the rate to preserve the trader's exact amount A:
+///      buy:  hookFee = floor(A * 425 / (10_000 + 425)), imdLeg = A - hookFee
+///      sell: hookFee = ceil(A * r / (10_000 - r)), imdLeg = A + hookFee, r = 425 + surchargeBps
+///      This differs from separately floored fees on imdLeg by at most 1 wei on buys and 2 on
+///      sells. With a sell surcharge, baseFee remains floor(imdLeg * 425 / 10_000) and surcharge
+///      is the rest; without one, all of hookFee is baseFee. The LP fee is never overridden:
+///      the pool charges its own 1.25% on the input side inside the swap as usual.
 ///
 ///      THE FOUR SWAP CASES. "imdLeg" is the IMD amount the hook fee is applied to:
 ///
 ///      1. exact-input BUY  (IMD in, amountSpecified < 0, IMD is the specified currency):
-///         handled in beforeSwap via beforeSwapReturnDelta. imdLeg = the IMD the swapper pays
-///         (|amountSpecified|). The hook keeps hookFee of it; the pool swaps the remainder.
+///         handled in beforeSwap via beforeSwapReturnDelta. imdLeg = |amountSpecified| - hookFee.
+///         The hook keeps hookFee; the pool swaps imdLeg.
 ///         The swapper pays exactly |amountSpecified| IMD.
 ///      2. exact-output BUY (MONEYBACK out, amountSpecified > 0, IMD is the unspecified currency):
 ///         handled in afterSwap via afterSwapReturnDelta. imdLeg = the IMD the pool actually
@@ -164,8 +170,8 @@ library Hooks {
 ///      4. exact-output SELL (IMD out, amountSpecified > 0, IMD is the specified currency):
 ///         handled in beforeSwap via beforeSwapReturnDelta, because the delta a hook returns from
 ///         afterSwap can only touch the unspecified currency (MONEYBACK) and the fee must be
-///         taken in IMD. imdLeg = the IMD the swapper asked for (amountSpecified). The pool is
-///         asked for imdLeg + hookFee, the hook keeps hookFee, the swapper receives exactly
+///         taken in IMD. imdLeg = amountSpecified + hookFee. The pool is
+///         asked for imdLeg, the hook keeps hookFee, the swapper receives exactly
 ///         amountSpecified IMD (surcharge applies).
 ///
 ///      In short: IMD specified (cases 1 and 4) -> beforeSwapReturnDelta on the specified
@@ -394,8 +400,9 @@ contract MoneyBackHook is IHooks, IUnlockCallback {
         // IMD is specified iff (exact input and IMD is the input) or (exact output and IMD is the output).
         if (exactInput == isSell) return (IHooks.beforeSwap.selector, BeforeSwapDelta.wrap(0), 0);
 
-        uint256 imdLeg = exactInput ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
-        uint256 hookFee = _accrue(isSell, imdLeg);
+        uint256 specified = exactInput ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
+        (uint256 imdLeg, uint256 baseFee, uint256 surcharge) = _specifiedFeeParts(isSell, specified);
+        uint256 hookFee = _accrue(isSell, imdLeg, baseFee, surcharge);
         return (IHooks.beforeSwap.selector, _toBeforeSwapDelta(_toInt128(hookFee), 0), 0);
     }
 
@@ -414,16 +421,17 @@ contract MoneyBackHook is IHooks, IUnlockCallback {
         int256 imdDelta = _imdIsCurrency0 ? _amount0(delta) : _amount1(delta);
         if (exactInput != isSell) {
             uint256 specified = exactInput ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
-            (uint256 baseFee, uint256 surcharge) = _feeParts(isSell, specified);
+            (uint256 expectedLeg,,) = _specifiedFeeParts(isSell, specified);
             // v4 adds the beforeSwap specified delta to amountSpecified before swapping.
             // The fee is deterministic within this transaction (fixed constants and timestamp);
             // no transient state is needed, including for multiple swaps in the same unlock.
-            if (imdDelta != params.amountSpecified + int256(baseFee + surcharge)) revert PartialFill();
+            if (imdDelta != (isSell ? int256(expectedLeg) : -int256(expectedLeg))) revert PartialFill();
             return (IHooks.afterSwap.selector, 0);
         }
 
         uint256 imdLeg = imdDelta < 0 ? uint256(-imdDelta) : uint256(imdDelta);
-        uint256 hookFee = _accrue(isSell, imdLeg);
+        (uint256 baseFee, uint256 surcharge) = _feeParts(isSell, imdLeg);
+        uint256 hookFee = _accrue(isSell, imdLeg, baseFee, surcharge);
         return (IHooks.afterSwap.selector, _toInt128(hookFee));
     }
 
@@ -472,10 +480,11 @@ contract MoneyBackHook is IHooks, IUnlockCallback {
         return zeroForOne != _imdIsCurrency0;
     }
 
-    /// @dev Computes base fee and surcharge on `imdLeg` (each floored), mints the total as IMD
-    ///      claims to this hook, emits FeeAccrued, returns the total.
-    function _accrue(bool isSell, uint256 imdLeg) private returns (uint256 hookFee) {
-        (uint256 baseFee, uint256 surcharge) = _feeParts(isSell, imdLeg);
+    /// @dev Mints the fee as IMD claims, emits its components and actual pool leg, returns the total.
+    function _accrue(bool isSell, uint256 imdLeg, uint256 baseFee, uint256 surcharge)
+        private
+        returns (uint256 hookFee)
+    {
         hookFee = baseFee + surcharge;
         if (hookFee != 0) poolManager.mint(address(this), _imdId, hookFee);
         emit FeeAccrued(isSell, baseFee, surcharge, imdLeg);
@@ -484,6 +493,29 @@ contract MoneyBackHook is IHooks, IUnlockCallback {
     function _feeParts(bool isSell, uint256 imdLeg) private view returns (uint256 baseFee, uint256 surcharge) {
         baseFee = imdLeg * BASE_FEE_BPS / BPS;
         surcharge = isSell ? imdLeg * currentSurchargeBps() / BPS : 0;
+    }
+
+    /// @dev Inverts the pool-leg fee for an IMD-specified swap. With A = specified and r = total bps:
+    ///      buy: F = floor(A*r/(BPS+r)), P = A-F; sell: F = ceil(A*r/(BPS-r)), P = A+F.
+    ///      Round buys down so the fee cannot consume a tiny input; round sells up to cover the
+    ///      rate on the gross output while delivering exactly A. Against separately floored fees
+    ///      on P, this differs by at most 1 wei on buys and 2 wei on sells. Keep the sell base
+    ///      component floored while a surcharge is active; its remainder includes the rounding.
+    function _specifiedFeeParts(bool isSell, uint256 specified)
+        private
+        view
+        returns (uint256 imdLeg, uint256 baseFee, uint256 surcharge)
+    {
+        if (specified > uint256(uint128(type(int128).max))) revert AmountOverflow();
+        uint256 surchargeBps = isSell ? currentSurchargeBps() : 0;
+        uint256 rate = BASE_FEE_BPS + surchargeBps;
+        uint256 denominator = isSell ? BPS - rate : BPS + rate;
+        uint256 numerator = specified * rate;
+        uint256 hookFee = isSell ? (numerator + denominator - 1) / denominator : numerator / denominator;
+        imdLeg = isSell ? specified + hookFee : specified - hookFee;
+        if (imdLeg > uint256(uint128(type(int128).max))) revert AmountOverflow();
+        baseFee = surchargeBps == 0 ? hookFee : imdLeg * BASE_FEE_BPS / BPS;
+        surcharge = hookFee - baseFee;
     }
 
     function _toInt128(uint256 x) private pure returns (int128) {

@@ -257,18 +257,14 @@ contract PayoutHandler {
         ledgerPaid[roundId] = got;
         for (uint256 i = 0; i < n; ++i) {
             if (token.revertsFor(to[i])) {
-                if (ledgerFailed[roundId][to[i]] == 0) ledgerFailedCount[roundId]++;
+                if (amounts[i] != 0 && ledgerFailed[roundId][to[i]] == 0) ledgerFailedCount[roundId]++;
                 ledgerFailed[roundId][to[i]] += amounts[i];
             }
         }
-        // failedCount in the contract counts legs, not distinct recipients: record both.
-        legsFailed[roundId] = expectFailed;
         paidRounds.push(roundId);
         roundsPaid++;
         if (expectFailed > 0) roundsWithFailures++;
     }
-
-    mapping(uint256 => uint256) public legsFailed;
 
     function retry(uint256 roundSeed, uint256 recipientSeed) external {
         if (paidRounds.length == 0) return;
@@ -544,6 +540,7 @@ contract RoundPayoutTest {
     }
 
     function test_renounceOwnershipLocksEverything() public {
+        _fund(1_000e18);
         vm.prank(STRANGER);
         vm.expectRevert(abi.encodeWithSelector(RoundPayout.OwnableUnauthorizedAccount.selector, STRANGER));
         payout.renounceOwnership();
@@ -553,6 +550,10 @@ contract RoundPayoutTest {
         payout.renounceOwnership();
         assertEq(payout.owner(), address(0), "no owner");
         assertEq(payout.pendingOwner(), address(0), "pending cleared on renounce");
+        vm.prank(OWNER);
+        vm.expectRevert(abi.encodeWithSelector(RoundPayout.OwnableUnauthorizedAccount.selector, OWNER));
+        payout.sweep(address(token), OWNER, 1_000e18);
+        assertEq(token.balanceOf(address(payout)), 1_000e18, "funds stranded after renounce");
         vm.prank(OWNER);
         vm.expectRevert(abi.encodeWithSelector(RoundPayout.OwnableUnauthorizedAccount.selector, OWNER));
         payout.pause();
@@ -918,7 +919,7 @@ contract RoundPayoutTest {
         assertEq(failedCount, 2, "two failed legs");
     }
 
-    function test_duplicateFailedRecipientAccumulates() public {
+    function _payWithDuplicateFailures() internal {
         _fund(10);
         token.setRevertsFor(A, true);
         address[] memory to = new address[](3);
@@ -932,7 +933,87 @@ contract RoundPayoutTest {
         _pay(1, to, amts);
         assertEq(payout.failed(1, A), 7, "accumulated");
         (,,, uint256 failedCount,,) = _round(1);
-        assertEq(failedCount, 2, "two legs failed");
+        assertEq(failedCount, 1, "one distinct failed recipient");
+    }
+
+    function test_duplicateFailedRecipientAccumulates() public {
+        _payWithDuplicateFailures();
+    }
+
+    function test_duplicateFailedRecipientRetryClearsWholeDebtAndCount() public {
+        _payWithDuplicateFailures();
+        address[] memory retry = new address[](1);
+        retry[0] = A;
+        vm.prank(OWNER);
+        assertEq(payout.retryFailed(1, retry), 0, "blocked recipient still fails");
+        (,,, uint256 failedCount,,) = _round(1);
+        assertEq(failedCount, 1, "failed retry preserves count");
+        token.setRevertsFor(A, false);
+        vm.prank(OWNER);
+        assertEq(payout.retryFailed(1, retry), 7, "retry pays aggregate");
+        assertEq(payout.failed(1, A), 0, "aggregate debt cleared");
+        (,,, failedCount,,) = _round(1);
+        assertEq(failedCount, 0, "no outstanding recipients");
+        (,,,,, uint256 totalPaid) = _round(1);
+        assertEq(totalPaid, 8, "successful retry counted once");
+        assertEq(token.balanceOf(A), 7, "recipient paid whole debt");
+        assertEq(token.balanceOf(address(payout)), 2, "conservation of funds");
+        vm.prank(OWNER);
+        vm.expectRevert(abi.encodeWithSelector(RoundPayout.NothingFailed.selector, 1, A));
+        payout.retryFailed(1, retry);
+    }
+
+    function test_duplicateFailedRecipientWriteOffClearsWholeDebtAndCount() public {
+        _payWithDuplicateFailures();
+        vm.prank(OWNER);
+        payout.writeOffFailed(1, A);
+        assertEq(payout.failed(1, A), 0, "aggregate written off");
+        (,,, uint256 failedCount,, uint256 totalPaid) = _round(1);
+        assertEq(failedCount, 0, "no outstanding recipients");
+        assertEq(totalPaid, 1, "write off is not a payment");
+        assertEq(token.balanceOf(address(payout)), 9, "write off retains funds");
+        vm.prank(OWNER);
+        vm.expectRevert(abi.encodeWithSelector(RoundPayout.NothingFailed.selector, 1, A));
+        payout.writeOffFailed(1, A);
+    }
+
+    function test_allDuplicateFailuresStillRevert() public {
+        _fund(7);
+        token.setRevertsFor(A, true);
+        (address[] memory to, uint256[] memory amounts) = _arr3(3, 4, 0);
+        to[1] = A;
+        to[2] = A;
+        vm.prank(OWNER);
+        vm.expectRevert(abi.encodeWithSelector(RoundPayout.AllTransfersFailed.selector, 1));
+        payout.payRound(1, address(token), to, amounts, 0, 0, 0);
+        assertTrue(!payout.isPaid(1), "all-failed round can be retried");
+        assertEq(payout.failed(1, A), 0, "failed debts rolled back");
+        assertEq(token.balanceOf(address(payout)), 7, "no funds moved");
+    }
+
+    function test_zeroAmountFailuresCreateNoOutstandingRecipient() public {
+        _fund(1);
+        token.setRevertsFor(A, true);
+        (address[] memory to, uint256[] memory amounts) = _arr3(0, 0, 1);
+        to[1] = A;
+        _pay(1, to, amounts);
+        (,,, uint256 failedCount,, uint256 totalPaid) = _round(1);
+        assertEq(failedCount, 0, "zero failures create no debt");
+        assertEq(totalPaid, 1, "nonzero success paid");
+        assertEq(payout.failed(1, A), 0, "nothing owed");
+    }
+
+    function test_zeroAmountSuccessPreventsAllFailedRevert() public {
+        _fund(4);
+        token.setRevertsFor(A, true);
+        (address[] memory to, uint256[] memory amounts) = _arr3(0, 4, 0);
+        to[1] = A;
+        _pay(1, to, amounts);
+        assertTrue(payout.isPaid(1), "zero-amount transfer succeeded");
+        (,,, uint256 failedCount,, uint256 totalPaid) = _round(1);
+        assertEq(failedCount, 1, "zero failure did not double count A");
+        assertEq(totalPaid, 0, "success paid zero");
+        assertEq(payout.failed(1, A), 4, "nonzero debt retained");
     }
 
     function test_allTransfersFailedReverts() public {
@@ -1150,7 +1231,11 @@ contract RoundPayoutTest {
         assertTrue(total <= fundAmt, "sum(Paid) <= funded");
         assertEq(token.balanceOf(address(payout)), fundAmt - expectPaid, "contract keeps failed + surplus");
         (,,, uint256 failedCount,, uint256 totalPaid) = _round(1);
-        assertEq(failedCount, expectFailed, "failedCount");
+        expectFailed = 0;
+        for (uint256 i; i < 3; ++i) {
+            if (blocked[i] && amts[i] != 0) ++expectFailed;
+        }
+        assertEq(failedCount, expectFailed, "distinct nonzero debts");
         assertEq(totalPaid, expectPaid, "record");
         for (uint256 i = 0; i < 3; ++i) {
             assertEq(payout.failed(1, to[i]), blocked[i] ? amts[i] : 0, "failed map");
@@ -1217,16 +1302,8 @@ contract RoundPayoutTest {
                 assertEq(payout.failed(id, who), handler.ledgerFailed(id, who), "failed vs ledger");
                 owed += payout.failed(id, who);
             }
-            // failedCount counts legs, so it is at least the number of distinct recipients still
-            // owed, and zero exactly when nothing is owed.
-            if (owed == 0) {
-                assertTrue(
-                    failedCount == 0 || handler.legsFailed(id) > handler.ledgerFailedCount(id),
-                    "failedCount with nothing owed"
-                );
-            } else {
-                assertTrue(failedCount >= handler.ledgerFailedCount(id), "failedCount below owed recipients");
-            }
+            assertEq(failedCount, handler.ledgerFailedCount(id), "failedCount equals outstanding recipients");
+            assertTrue((failedCount == 0) == (owed == 0), "count is zero exactly when no debt remains");
         }
         // Unpaid ids stay unpaid.
         assertTrue(!payout.isPaid(handler.nextRound()), "future round paid");

@@ -1,4 +1,6 @@
-# Imported audit: reproductions and repairs
+# Earlier round: imported audit reproductions and repairs
+
+This file records the accepted earlier round, before the fee-base and failed-count findings reopened the work. Its unchanged-formula statements, test totals and runtime sizes are historical. Current changes and checks are in [REVISION.md](REVISION.md); every supplied finding is answered in [the revision response file](../.imd-responses.json).
 
 This is the implementation response to the eight supplied entries, not a new independent audit. Production changes are limited to the partial-fill guard, router funding/settlement, and associated comments. Fee constants, permission flags, token and RoundPayout logic remain unchanged.
 
