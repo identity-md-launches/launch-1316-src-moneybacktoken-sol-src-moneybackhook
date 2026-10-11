@@ -9,8 +9,8 @@ The four supplied contracts came from swarm jobs `57052175` and `cb7160d0`. The 
 - [launch.json](launch.json): installed IMD `univ4_hook` format, deploying the token and hook.
 - [DeployAuxiliaries.s.sol](script/DeployAuxiliaries.s.sol): deploys RoundPayout and MoneyBackRouter after the factory launch, with explicit address validation.
 - [Requester share](docs/requester-share.json): the protocol's two-field requester-share input, for the launch service; **not an additional launch manifest** and not automatically consumed by `launch.json`.
-- [Revision responses](.imd-responses.json): disposition of all fourteen supplied findings.
-- [Revision evidence](docs/REVISION.md): reproductions, fixes, rounding and current validation.
+- [Launch review](docs/LAUNCH_REVIEW.md): the four audit findings imported at launch, reproduced against the real PoolManager, with their dispositions, the derived opening prices, deployment parameters and operational responsibilities. No production source changed in that pass.
+- [Revision evidence](docs/REVISION.md): reproductions, fixes, rounding and validation of the earlier revision round (its response file was consumed by that round and is not part of this tree).
 - [Earlier audit responses](docs/AUDIT_RESPONSES.md): the previous round's evidence and validation limits.
 - [Network observations](docs/network-observations.json): pinned, read-only checks of IMD and the public ETH/IMD pool.
 - [PNG logo](assets/moneyback.png) and [SVG source](assets/moneyback.svg): one large, centered open umbrella with a hooked handle, `#FFC83D` on a full-square `#17356B` background. The PNG is 1024 × 1024 RGB; no text, rain, border or gradient.
@@ -38,12 +38,14 @@ The protected configuration pins Solidity **0.8.26**, Cancun, optimizer 200 runs
 | Permissions | `beforeInitialize`, `beforeSwap`, `afterSwap`, `beforeSwapReturnDelta`, `afterSwapReturnDelta` |
 | Paired currency | IMD `0x5f7bb59365ce557c26dbcaa4ee9d39a4b95b7127` (18 decimals) |
 | LP fee / spacing | `12500` (1.25%) / `60` |
-| Manifest initialPrice | `"79228162514264337593543950336"` (2^96), explicitly supplied by the brief |
-| Opening valuation policy | 2,500 IMD for the whole supply; actual opening sqrt price derived by the launch deployer using the final currency ordering |
+| Manifest initialPrice | `"79228162514264337593543950336"` (2^96), the launch policy's literal; the deployer does not open the pool at it |
+| Opening valuation policy | 2,500 IMD for the whole supply (0.0000025 IMD per MONEYBACK); the deployer derives the opening sqrt price from it and the final currency ordering |
+| Derived opening price, MONEYBACK = currency0 | sqrtPriceX96 `125270724187523965593206901` (tick about -128,999) |
+| Derived opening price, MONEYBACK = currency1 | sqrtPriceX96 `50108289675009586237282760313921` (tick about 128,998) |
 | Auxiliary payer | `RoundPayout(paying wallet)` |
 | Auxiliary router | `MoneyBackRouter(actual poolManager, actual mined hook address)` |
 
-The manifest's initialPrice is the brief's protocol provenance value. It is not an instruction to bypass the launch policy's address-dependent opening-price calculation. Both assets have 18 decimals; the stated opening valuation corresponds to 0.0000025 IMD per MONEYBACK. The factory resolves `$poolManager` and `$token`, mines the hook address for **the final compiled bytecode and arguments**, deploys the hook, and initializes its pool in the same transaction. Do not reuse a pre-repair CREATE2 salt. No PoolManager address is hardcoded in production source, deployment scripts or the manifest.
+The manifest's initialPrice is the launch policy's literal, which the policy requires in `pool.initialPrice`. It is not the price the pool opens at: the deployer derives that from the 2,500 IMD whole-supply valuation and the mined token address, and the two possible results are in the table so the choice can be checked against the sort order. `beforeInitialize` deliberately ignores `sqrtPriceX96`, and the real-PoolManager suite opens the pool at both derived prices and at parity. The factory resolves `$poolManager` and `$token`, mines the hook address for **the final compiled bytecode and arguments**, deploys the hook, and initializes its pool in the same transaction. That single transaction matters: `beforeInitialize` checks that its caller is the PoolManager but not who asked the PoolManager, so a hook left deployed and unbound could be bound by anyone at any price (see [the launch review](docs/LAUNCH_REVIEW.md)). Do not reuse a pre-repair CREATE2 salt and never redeploy the hook. No PoolManager address is hardcoded in production source, deployment scripts or the manifest.
 
 ### Token distribution
 
@@ -104,7 +106,7 @@ The router has no rescue function or owner. MONEYBACK or IMD transferred directl
 
 ### Scope of the surcharge
 
-Flags `0x20CC` include no liquidity callbacks. A holder can supply single-sided liquidity, let others buy through it, and remove IMD without a sell swap of their own. OTC transfers and trades in other pools also fall outside this hook. The surcharge is a fee on swaps through this pool, not a guarantee that every economic sale is taxed. Adding a liquidity restriction would change the explicitly fixed permission requirements, so this revision retains them and includes a real-v4 regression demonstrating the limit.
+Flags `0x20CC` include no liquidity callbacks. A holder can supply single-sided liquidity, let others buy through it, and remove IMD without a sell swap of their own. OTC transfers and trades in other pools also fall outside this hook. The surcharge is a fee on swaps through this pool, not a guarantee that every economic sale is taxed. Adding a liquidity restriction would change the explicitly fixed permission requirements, so this revision retains them and includes a real-v4 regression demonstrating the limit. The launch audit reported the same path (finding `e1b55a37…`, low) and it is answered, unchanged, in [the launch review](docs/LAUNCH_REVIEW.md).
 
 ## Deployment sequence
 

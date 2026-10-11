@@ -16,11 +16,13 @@ import {Hooks} from "./vendor/v4-core/src/libraries/Hooks.sol";
 import {CustomRevert} from "./vendor/v4-core/src/libraries/CustomRevert.sol";
 import {StateLibrary} from "./vendor/v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "./vendor/v4-core/src/libraries/TickMath.sol";
+import {FullMath} from "./vendor/v4-core/src/libraries/FullMath.sol";
 
 interface VmRealV4 {
     function etch(address, bytes calldata) external;
     function warp(uint256) external;
     function deal(address, uint256) external;
+    function prank(address) external;
     function expectRevert(bytes calldata) external;
     function snapshotState() external returns (uint256);
     function revertToState(uint256) external returns (bool);
@@ -55,6 +57,13 @@ abstract contract RealV4Fixture is IUnlockCallback {
     uint160 constant Q96 = 1 << 96;
     uint256 constant T0 = 1_750_000_000;
     int256 constant LIQUIDITY = 1e24;
+    /// @dev The launch policy's opening valuation: 2,500 IMD for the whole 1,000,000,000 supply, both at
+    ///      18 decimals, so 0.0000025 IMD per MONEYBACK. sqrtPriceX96 = sqrt(price1/price0) * 2^96:
+    ///      MONEYBACK as currency0 -> sqrt(2.5e-6) * 2^96; MONEYBACK as currency1 -> sqrt(400000) * 2^96.
+    uint160 constant POLICY_SQRT_PRICE_TOKEN0 = 125270724187523965593206901;
+    uint160 constant POLICY_SQRT_PRICE_TOKEN1 = 50108289675009586237282760313921;
+    /// @dev 81% of the supply: the factory's single-sided pool seed (requester 90% x poolBps 9000).
+    uint256 constant POOL_SEED = 810_000_000e18;
 
     PoolManager manager;
     MoneyBackToken token;
@@ -70,6 +79,12 @@ abstract contract RealV4Fixture is IUnlockCallback {
     }
 
     function _boot(bool singleSided) internal {
+        _bootAt(Q96, singleSided, true);
+    }
+
+    /// @dev Deploys manager, token (in the wanted sort order) and hook; initializes the pool at `price`
+    ///      and seeds it unless `initializeNow` is false, in which case the hook is left unbound.
+    function _bootAt(uint160 price, bool singleSided, bool initializeNow) internal {
         vm.warp(T0);
         vm.deal(address(this), 1e30);
         vm.etch(IMD, address(new IntegrationIMD()).code);
@@ -103,13 +118,56 @@ abstract contract RealV4Fixture is IUnlockCallback {
             tickSpacing: 60,
             hooks: IHooks(address(hook))
         });
-        manager.initialize(key, Q96);
+        if (!initializeNow) return;
+        manager.initialize(key, price);
         router = new MoneyBackRouter(HookManager(address(manager)), address(hook));
-        if (singleSided) {
+        if (price != Q96) {
+            _seedSingleSided(price, POOL_SEED);
+        } else if (singleSided) {
             _liquidity(key, tokenIs0 ? int24(0) : int24(-600), tokenIs0 ? int24(600) : int24(0), LIQUIDITY, 0);
         } else {
             _liquidity(key, -600, 600, LIQUIDITY, 0);
         }
+    }
+
+    /// @dev The factory's seed shape: `amount` MONEYBACK in one range entirely on the MONEYBACK side of
+    ///      the opening price (above it when MONEYBACK is currency0, below it when it is currency1), so
+    ///      the position holds no IMD at all. Liquidity is derived from the amount the way a periphery
+    ///      LiquidityAmounts helper would.
+    function _seedSingleSided(uint160 price, uint256 amount) internal {
+        int24 tick = TickMath.getTickAtSqrtPrice(price);
+        int24 lower;
+        int24 upper;
+        if (tokenIs0) {
+            lower = (tick / 60 + 1) * 60;
+            upper = lower + 12_000;
+        } else {
+            upper = (tick / 60) * 60;
+            lower = upper - 12_000;
+        }
+        uint160 sa = TickMath.getSqrtPriceAtTick(lower);
+        uint160 sb = TickMath.getSqrtPriceAtTick(upper);
+        uint256 liquidity = tokenIs0
+            ? FullMath.mulDiv(amount, FullMath.mulDiv(sa, sb, Q96), sb - sa)
+            : FullMath.mulDiv(amount, Q96, sb - sa);
+        BalanceDelta seeded = _liquidity(key, lower, upper, int256(liquidity), 0);
+        require(_imd(seeded) == 0 && _moneyback(seeded) < 0, "seed must be MONEYBACK only");
+        require(uint256(-_moneyback(seeded)) <= amount, "seed must not exceed the requester's pool share");
+        require(uint256(-_moneyback(seeded)) + 1e18 >= amount, "seed must use the whole pool share");
+    }
+
+    function _policyPrice() internal view returns (uint160) {
+        return tokenIs0 ? POLICY_SQRT_PRICE_TOKEN0 : POLICY_SQRT_PRICE_TOKEN1;
+    }
+
+    function _hookRevert(bytes4 callback, bytes4 reason) internal view returns (bytes memory) {
+        return abi.encodeWithSelector(
+            CustomRevert.WrappedError.selector,
+            address(hook),
+            callback,
+            abi.encodeWithSelector(reason),
+            abi.encodeWithSelector(Hooks.HookCallFailed.selector)
+        );
     }
 
     function _predict(bytes32 salt, bytes32 codeHash) private view returns (address) {
@@ -408,6 +466,92 @@ abstract contract RealV4Fixture is IUnlockCallback {
         require(_imd(delta) == (sell ? int256(amount) : -int256(amount)), "specified fill");
         uint256 fee = hook.pending();
         _assertPoolLegFee(sell, true, sell ? amount + fee : amount - fee, fee);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Launch review: opening price and initialization window
+    // ---------------------------------------------------------------------------------------------
+
+    /// @notice The manifest's initialPrice is the policy literal 2^96; the deployer opens the pool at
+    ///         the price derived from the 2,500 IMD whole-supply valuation and the final currency
+    ///         order. The hook ignores sqrtPriceX96, so it must accept that derived price in either
+    ///         order, take the factory's 81% single-sided seed with no IMD in the manager, serve a
+    ///         first buy at the documented valuation, charge its fee as an IMD claim and sweep it.
+    function test_policyOpeningPriceSingleSidedSeedFirstBuyAndSweep() public {
+        _bootAt(_policyPrice(), true, true);
+        (uint160 opened, int24 tick,,) = IPoolManager(address(manager)).getSlot0(key.toId());
+        require(opened == _policyPrice(), "pool opened at the derived policy price");
+        require(tokenIs0 ? tick < 0 : tick > 0, "MONEYBACK is worth less than one IMD");
+        require(hook.initializedAt() == T0 && hook.pending() == 0, "hook bound at the derived price");
+        require(IntegrationIMD(IMD).balanceOf(address(manager)) == 0, "single-sided seed holds no IMD");
+        require(token.balanceOf(address(manager)) + 1e18 >= POOL_SEED, "manager holds the 81% seed");
+
+        BalanceDelta delta = _trade(_params(false, true, 1e18, false));
+        uint256 fee = hook.pending();
+        require(_imd(delta) == -1e18, "buyer paid exactly one IMD");
+        _assertPoolLegFee(false, true, 1e18 - fee, fee);
+        // 1 IMD buys about 1 / 0.0000025 = 400,000 MONEYBACK before the 4.25% hook fee and 1.25% LP fee:
+        // 400,000 * (10000/10425) * (1 - 0.0125) ~ 378,900 tokens. The single-sided range starts at the
+        // next tick-spacing boundary (up to 60 ticks, 0.6%, away from the opening price) and slippage on
+        // an 810M seed is negligible, so the first buyer receives about 374,000 to 377,000 tokens.
+        uint256 bought = uint256(_moneyback(delta));
+        require(bought > 370_000e18 && bought < 379_000e18, "first buy priced at the policy valuation");
+
+        uint256 beforePayout = IntegrationIMD(IMD).balanceOf(PAYOUT);
+        hook.sweep();
+        require(hook.pending() == 0, "claim redeemed");
+        require(IntegrationIMD(IMD).balanceOf(PAYOUT) - beforePayout == fee, "fee swept as IMD to payout");
+    }
+
+    /// @notice Both decaying surcharge and base fee apply unchanged at the policy price: an exact-input
+    ///         sell at initialization pays 24.25% of the pool's IMD output, a buy only 4.25%.
+    function test_policyOpeningPriceSellSurchargeApplies() public {
+        _bootAt(_policyPrice(), true, true);
+        _trade(_params(false, true, 10e18, false));
+        uint256 buyFee = hook.pending();
+        _assertPoolLegFee(false, true, 10e18 - buyFee, buyFee);
+        BalanceDelta sold = _trade(_params(true, true, 100_000e18, false));
+        uint256 sellFee = hook.pending() - buyFee;
+        require(_imd(sold) > 0 && _moneyback(sold) == -int256(100_000e18), "sell filled from the buy's IMD");
+        require(hook.currentSurchargeBps() == 2000, "inside the surcharge window");
+        require(sellFee == _fee(true, uint256(_imd(sold)) + sellFee), "24.25% of the pool's IMD output");
+    }
+
+    /// @notice Once the factory has bound the pool, nobody can initialize another pool on this hook or
+    ///         re-initialize the bound one: the hook refuses before the PoolManager even looks.
+    function test_boundPoolRefusesAnySecondInitialize() public {
+        address stranger = address(0xA11CE);
+        vm.prank(stranger);
+        vm.expectRevert(_hookRevert(IHooks.beforeInitialize.selector, MoneyBackHook.AlreadyBound.selector));
+        manager.initialize(key, TickMath.MIN_SQRT_PRICE + 1);
+
+        PoolKey memory other = key;
+        other.fee = 3000;
+        vm.prank(stranger);
+        vm.expectRevert(_hookRevert(IHooks.beforeInitialize.selector, MoneyBackHook.AlreadyBound.selector));
+        manager.initialize(other, Q96);
+        require(hook.initializedAt() == T0, "binding unchanged");
+    }
+
+    /// @notice Audit finding cf9fbd17 (info), reproduced: beforeInitialize checks msg.sender (the
+    ///         PoolManager) but not the initializing `sender`. A hook deployed and left unbound could
+    ///         be bound by anyone at any price, after which the factory's own initialize would fail.
+    ///         The launch factory deploys the hook and initializes its pool in one transaction, which
+    ///         leaves no such window; this test pins the behaviour the launch relies on and is the
+    ///         reason deployment and initialization must never be split across transactions.
+    function test_unboundHookIsBoundByWhoeverInitializesFirst() public {
+        _bootAt(Q96, false, false);
+        require(hook.initializedAt() == 0, "hook deployed unbound");
+        address stranger = address(0xA11CE);
+        vm.prank(stranger);
+        manager.initialize(key, TickMath.MIN_SQRT_PRICE + 1);
+        require(hook.initializedAt() == T0, "stranger bound the pool and started the surcharge clock");
+        (uint160 opened,,,) = IPoolManager(address(manager)).getSlot0(key.toId());
+        require(opened == TickMath.MIN_SQRT_PRICE + 1, "at the stranger's price");
+
+        // The factory's initialize for the same key can no longer succeed.
+        vm.expectRevert(_hookRevert(IHooks.beforeInitialize.selector, MoneyBackHook.AlreadyBound.selector));
+        manager.initialize(key, Q96);
     }
 }
 
