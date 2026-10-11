@@ -1326,6 +1326,7 @@ contract MoneyBackHookTest is HookFixture {
 
     /// forge-config: default.invariant.runs = 64
     /// forge-config: default.invariant.depth = 40
+    /// forge-config: default.invariant.fail-on-revert = true
     function invariant_hookNeverHoldsMoneybackClaims() public view {
         assertEq(pm.balanceOf(address(hook), _tokenId()), 0, "MONEYBACK claims");
         assertEq(handler.maxTokenSideHookDelta(), 0, "hook delta on MONEYBACK side");
@@ -1334,6 +1335,7 @@ contract MoneyBackHookTest is HookFixture {
 
     /// forge-config: default.invariant.runs = 64
     /// forge-config: default.invariant.depth = 40
+    /// forge-config: default.invariant.fail-on-revert = true
     function invariant_pendingEqualsAccruedMinusSwept() public view {
         assertEq(hook.pending(), handler.accrued() - handler.swept(), "pending != accrued - swept");
         assertEq(pm.balanceOf(address(hook), _imdId()), hook.pending(), "pending == claim balance");
@@ -1341,6 +1343,7 @@ contract MoneyBackHookTest is HookFixture {
 
     /// forge-config: default.invariant.runs = 64
     /// forge-config: default.invariant.depth = 40
+    /// forge-config: default.invariant.fail-on-revert = true
     function invariant_sweepPaysOnlyPayout() public view {
         assertEq(_imdOf(PAYOUT), handler.swept(), "payout got exactly what was swept");
         assertEq(_imdOf(address(pm)), PM_IMD - handler.swept(), "manager paid only the swept amount");
@@ -1351,6 +1354,7 @@ contract MoneyBackHookTest is HookFixture {
 
     /// forge-config: default.invariant.runs = 64
     /// forge-config: default.invariant.depth = 40
+    /// forge-config: default.invariant.fail-on-revert = true
     function invariant_lpFeeNeverOverriddenAndManagerLocked() public view {
         assertEq(handler.lpFeeOverrides(), 0, "LP fee override returned");
         assertTrue(!pm.unlocked(), "manager left unlocked");

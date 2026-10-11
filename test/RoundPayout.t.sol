@@ -347,8 +347,13 @@ contract PayoutHandler {
         uint256[] memory amounts = new uint256[](1);
         to[0] = recipients[0];
         amounts[0] = 0;
+        bool paused = payout.paused();
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(RoundPayout.RoundAlreadyPaid.selector, roundId));
+        vm.expectRevert(
+            paused
+                ? abi.encodeWithSelector(RoundPayout.EnforcedPause.selector)
+                : abi.encodeWithSelector(RoundPayout.RoundAlreadyPaid.selector, roundId)
+        );
         payout.payRound(roundId, address(token), to, amounts, 0, 0, 0);
     }
 
@@ -1265,6 +1270,7 @@ contract RoundPayoutTest {
 
     /// forge-config: default.invariant.runs = 96
     /// forge-config: default.invariant.depth = 40
+    /// forge-config: default.invariant.fail-on-revert = true
     function invariant_balanceEqualsFundedMinusPaidMinusSwept() public view {
         assertEq(
             token.balanceOf(address(payout)),
@@ -1275,6 +1281,7 @@ contract RoundPayoutTest {
 
     /// forge-config: default.invariant.runs = 96
     /// forge-config: default.invariant.depth = 40
+    /// forge-config: default.invariant.fail-on-revert = true
     function invariant_sumPaidNeverExceedsFunded() public view {
         assertTrue(handler.paidTotal() + handler.sweptTotal() <= handler.funded(), "paid out more than funded");
         // Recipients hold exactly what was paid to them.
@@ -1287,6 +1294,7 @@ contract RoundPayoutTest {
 
     /// forge-config: default.invariant.runs = 96
     /// forge-config: default.invariant.depth = 40
+    /// forge-config: default.invariant.fail-on-revert = true
     function invariant_roundRecordsMatchLedger() public view {
         uint256 n = handler.paidRoundCount();
         for (uint256 i = 0; i < n; ++i) {
@@ -1311,6 +1319,7 @@ contract RoundPayoutTest {
 
     /// forge-config: default.invariant.runs = 96
     /// forge-config: default.invariant.depth = 40
+    /// forge-config: default.invariant.fail-on-revert = true
     function invariant_ownerNeverChangesWithoutHandoff() public view {
         assertEq(payout.owner(), OWNER, "owner drifted");
         assertEq(payout.pendingOwner(), address(0), "pending owner set");
