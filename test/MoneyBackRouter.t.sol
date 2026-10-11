@@ -1819,12 +1819,14 @@ contract MoneyBackRouterTest is RouterFixture {
 
     /// forge-config: default.invariant.runs = 64
     /// forge-config: default.invariant.depth = 40
+    /// forge-config: default.invariant.fail-on-revert = true
     function invariant_routerHoldsNothing() public view {
         _assertRouterEmpty();
     }
 
     /// forge-config: default.invariant.runs = 64
     /// forge-config: default.invariant.depth = 40
+    /// forge-config: default.invariant.fail-on-revert = true
     function invariant_hookPendingEqualsRouterFeesMinusSwept() public view {
         assertEq(hook.pending(), handler.feesAccrued() - handler.swept(), "pending != fees - swept");
         assertEq(_imdOf(PAYOUT), handler.swept(), "payout got exactly what was swept");
@@ -1834,6 +1836,7 @@ contract MoneyBackRouterTest is RouterFixture {
 
     /// forge-config: default.invariant.runs = 64
     /// forge-config: default.invariant.depth = 40
+    /// forge-config: default.invariant.fail-on-revert = true
     function invariant_valueIsConserved() public view {
         address third = handler.actors(2);
         uint256 eth = address(pm).balance + ALICE.balance + BOB.balance + third.balance + address(router).balance;
@@ -1850,6 +1853,7 @@ contract MoneyBackRouterTest is RouterFixture {
 
     /// forge-config: default.invariant.runs = 64
     /// forge-config: default.invariant.depth = 40
+    /// forge-config: default.invariant.fail-on-revert = true
     function invariant_bindingsNeverChange() public view {
         assertEq(address(router.hook()), address(hook), "hook");
         assertEq(router.token(), address(token), "token");

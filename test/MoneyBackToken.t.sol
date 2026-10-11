@@ -345,12 +345,14 @@ contract MoneyBackTokenTest {
 
     /// forge-config: default.invariant.runs = 128
     /// forge-config: default.invariant.depth = 32
+    /// forge-config: default.invariant.fail-on-revert = true
     function invariant_totalSupplyNeverChanges() public view {
         assertEq(token.totalSupply(), SUPPLY, "supply drifted");
     }
 
     /// forge-config: default.invariant.runs = 128
     /// forge-config: default.invariant.depth = 32
+    /// forge-config: default.invariant.fail-on-revert = true
     function invariant_balancesSumToSupply() public view {
         uint256 sum = token.balanceOf(address(this)) + token.balanceOf(address(handler))
             + token.balanceOf(handler.actors(0)) + token.balanceOf(handler.actors(1))
@@ -360,6 +362,7 @@ contract MoneyBackTokenTest {
 
     /// forge-config: default.invariant.runs = 128
     /// forge-config: default.invariant.depth = 32
+    /// forge-config: default.invariant.fail-on-revert = true
     function invariant_zeroAddressHoldsNothing() public view {
         assertEq(token.balanceOf(address(0)), 0, "zero address balance");
     }

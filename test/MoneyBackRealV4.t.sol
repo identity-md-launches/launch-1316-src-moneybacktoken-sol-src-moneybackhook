@@ -48,7 +48,7 @@ contract IntegrationIMD {
 
 /// @dev Real v4-core pool math, hooks, claims, locks and settlement; no simulated swap deltas.
 ///      Inherited twice to exercise both actual sorted currency orders with the real launch token.
-abstract contract RealV4Fixture is IUnlockCallback {
+abstract contract RealV4Environment is IUnlockCallback {
     using StateLibrary for IPoolManager;
 
     VmRealV4 constant vm = VmRealV4(address(uint160(uint256(keccak256("hevm cheat code")))));
@@ -277,6 +277,11 @@ abstract contract RealV4Fixture is IUnlockCallback {
         // Inverse fee rounding (at most 2) plus v4's pool/LP rounding (at most 1 fee unit).
         require(firstFee + 3 >= secondFee && secondFee + 3 >= firstFee, "same fee independent of swap form");
     }
+}
+
+/// @dev Scenario tests share the same environment as the real-manager stateful suite.
+abstract contract RealV4Fixture is RealV4Environment {
+    using StateLibrary for IPoolManager;
 
     function test_equivalentBuysAndSellsAtDecayBoundaries() public {
         uint256[5] memory elapsed = [uint256(0), 900, 1799, 1800, 3600];
